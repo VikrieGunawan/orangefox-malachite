@@ -1,517 +1,661 @@
-name: Build OrangeFox Recovery (malachite)
+# =============================================================================
+# UNOFFICIAL OrangeFox Recovery build for Redmi Note 14 Pro 5G (malachite)
+# =============================================================================
+#
+# Design notes:
+#
+#   * Device : Redmi Note 14 Pro 5G (malachite) - MT6878 (Dimensity 7300 Ultra),
+#              GKI kernel 6.1, HyperOS 2 Global (2.0.208.0.VOOMIXM), A/B with
+#              virtual-ab; recovery lives in vendor_boot (boot header v4).
+#   * Base   : OrangeFox fox_16.0 (Android 16, release config bp2a) - matches
+#              the Android 16 ROMs to be installed (PixelOS 16.2, LineageOS 23.2).
+#   * Device tree : proven community tree mytiantian001/android_device_xiaomi_malachite_twrp
+#              (branch A16, hardware-tested, target = mka vendorbootimage),
+#              pulled at build time via a generated local manifest. Binary
+#              assets it ships (prebuilt dtb, miui releasekey) cannot be inlined
+#              as text, so this workflow file remains the ONLY repo file.
+#   * Fox-ify: generates the OrangeFox device-tree contract at build time:
+#              vendorsetup.sh (FOX_* build vars, official amethyst template),
+#              fox_malachite.mk (OF_* UI flags), wires it into twrp_malachite.mk,
+#              applies the proven minuitwrp haptics patch when applicable.
+#   * Sync guards (proven in earlier iterations):
+#              - dangling <remove-project> auto-fix (repo manifest parse loop)
+#              - dynamic overlay dropping OrangeFox repos pinned to privately
+#                fetchable revisions (external/libarchive, external/libfuse3,
+#                external/icu, external/fox-go) - intersected with the current
+#                manifest so it can never dangle; consumer-drift early warning
+#              - warning-only pre-flight ls-remote of OrangeFox-remote projects
+#              - sync retry ladder -j8 fail-fast -> -j4 -> -j2 (incremental)
+#   * Anti-OOM (new in this iteration - the previous run died when soong_build
+#     reached 14.4 GB RSS on a 15 GB runner with only 3 GB swap):
+#              - 16 GB swapfile + vm.swappiness=100
+#              - GOMEMLIMIT caps the Go heap of soong_build (it is a Go binary)
+#              - aggressive GitHub-runner disk cleanup (~25-30 GB freed)
+#              - ninja parallelism capped at -j2 (input-tunable)
+#              - auto-retry with "missing/unknown module" device-tree repair
+#
+#   Output: vendor_boot image (fastboot flash vendor_boot) + OrangeFox zip if
+#   the build packages one. ADB sideload and A/B OTA (payload.bin) zip install
+#   are included via update_engine_sideload in the device tree.
+#
+# =============================================================================
+
+name: Build OrangeFox (UNOFFICIAL) — malachite
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main, master ]
+    inputs:
+      fox_branch:
+        description: "OrangeFox manifest branch (gitlab.com/OrangeFox/Manifest)"
+        required: false
+        default: "fox_16.0"
+      gomemlimit:
+        description: "Go heap limit for soong_build (anti-OOM). Raise to 14GiB only if the build GC-thrashes."
+        required: false
+        default: "12GiB"
+      build_jobs:
+        description: "Ninja parallel jobs (2 recommended on a 16 GB / 4-core runner)"
+        required: false
+        default: "2"
 
-env:
-  # OrangeFox manifest (fox_16.0 = Android 16 based, the only active branch)
-  MANIFEST_URL: https://gitlab.com/OrangeFox/Manifest.git
-  MANIFEST_BRANCH: fox_16.0
-  # Verified device tree base (TWRP for malachite, Android 16, hardware-tested)
-  DEVICE_TREE_URL: https://github.com/mytiantian001/android_device_xiaomi_malachite_twrp
-  DEVICE_TREE_BRANCH: A16
-  DEVICE_PATH: device/xiaomi/malachite
-  DEVICE_CODENAME: malachite
-  # Recovery lives in vendor_boot on this device (A/B, no dedicated recovery partition)
-  BUILD_TARGET: vendorbootimage
-  # Shown inside the recovery UI
-  MAINTAINER: Unofficial Builder
+permissions:
+  contents: read
 
-# Never run two builds at once: a new push/dispatch automatically replaces a
-# running build. (The replaced run ends with exit code 143 — that is the normal
-# cancellation signal, not a build error.)
 concurrency:
-  group: orangefox-malachite-build
+  group: fox-malachite-build
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Build OrangeFox Unofficial (malachite)
-    runs-on: ubuntu-22.04
-    # Hard cap for GitHub-hosted runners is 360 minutes per job.
+    name: OrangeFox fox_16.0 / malachite / vendor_boot
+    runs-on: ubuntu-latest
     timeout-minutes: 360
 
+    env:
+      MANIFEST_URL: https://gitlab.com/OrangeFox/Manifest.git
+      MANIFEST_BRANCH: ${{ inputs.fox_branch || 'fox_16.0' }}
+      DEVICE: malachite
+      DT_REPO: mytiantian001/android_device_xiaomi_malachite_twrp
+      DT_BRANCH: A16
+      SRC: /home/runner/work/foxsrc
+      GOMEMLIMIT: ${{ inputs.gomemlimit || '12GiB' }}
+      GOGC: "60"
+      BUILD_JOBS: ${{ inputs.build_jobs || '2' }}
+      CCACHE_DISABLE: "1"
+
     steps:
-      - name: Check out repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Free up disk space
+      # ------------------------------------------------------------------
+      # Step 1 - free disk space and create a big swapfile (anti-OOM core)
+      # ------------------------------------------------------------------
+      - name: Free disk space and add swap (anti-OOM)
         run: |
-          set -e
-          sudo rm -rf /usr/share/dotnet /usr/share/swift /opt/ghc /usr/local/.ghcup \
-                      /opt/hostedtoolcache/CodeQL /usr/local/lib/android /opt/pipx
-          sudo docker image prune -af >/dev/null 2>&1 || true
-          echo "Disk after cleanup:"
-          df -h /
+          echo "=== BEFORE ==="
+          df -h / /mnt 2>/dev/null || true
+          free -h || true
 
+          # Purge large preinstalled toolchains we never use (~25-30 GB).
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/share/swift /usr/local/lib/node_modules /opt/microsoft \
+            /opt/google /usr/local/share/powershell 2>/dev/null || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+          # Replace the tiny default swap with a 16 GB one.
+          sudo swapoff -a || true
+          sudo rm -f /swapfile /mnt/swapfile 2>/dev/null || true
+          FREE_ROOT=$(df -k / --output=avail | tail -n1 | tr -dc '0-9')
+          FREE_MNT=$(df -k /mnt --output=avail 2>/dev/null | tail -n1 | tr -dc '0-9')
+          FREE_MNT=${FREE_MNT:-0}
+          if [ "$FREE_MNT" -gt "$FREE_ROOT" ]; then SWAPDIR=/mnt; else SWAPDIR=/; fi
+          echo "Creating 16G swap at ${SWAPDIR}/swapfile"
+          sudo fallocate -l 16G "$SWAPDIR/swapfile" \
+            || sudo dd if=/dev/zero of="$SWAPDIR/swapfile" bs=1M count=16384 status=none
+          sudo chmod 600 "$SWAPDIR/swapfile"
+          sudo mkswap "$SWAPDIR/swapfile"
+          sudo swapon "$SWAPDIR/swapfile"
+          sudo sysctl -w vm.swappiness=100
+
+          echo "=== AFTER ==="
+          df -h / /mnt 2>/dev/null || true
+          free -h || true
+
+      # ------------------------------------------------------------------
+      # Step 2 - build dependencies (JDK 17 for the Android 16 base)
+      # ------------------------------------------------------------------
       - name: Install build dependencies
         run: |
           set -e
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq git zip curl build-essential libncurses5 \
-            libgl1-mesa-dev libxml2-utils xsltproc unzip rsync >/dev/null
-          sudo curl -s https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
-          sudo chmod a+x /usr/local/bin/repo
-          git config --global user.name "OrangeFox Builder"
-          git config --global user.email "builder@users.noreply.github.com"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git-core gnupg flex bison gperf build-essential zip curl \
+            zlib1g-dev gcc-multilib g++-multilib libc6-dev-i386 \
+            lib32ncurses-dev x11proto-core-dev libx11-dev lib32z-dev \
+            libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
+            python3 python3-pip rsync lz4 liblz4-tool zstd bc cpio \
+            openjdk-17-jdk
+          java -version
+          git --version
 
-      - name: Sync OrangeFox source tree (fox_16.0)
+      # ------------------------------------------------------------------
+      # Step 3 - repo init (OrangeFox fox_16.0) + generated local manifest
+      #          (GitLab throttles bursts: repo init is retried)
+      # ------------------------------------------------------------------
+      - name: repo init (OrangeFox) + local manifest (malachite)
         run: |
           set -e
-          echo "Sync started: $(date -u)"
-          mkdir -p workspace/fox_16.0
-          cd workspace/fox_16.0
-          repo init --depth=1 -u "$MANIFEST_URL" -b "$MANIFEST_BRANCH"
-          # -----------------------------------------------------------------
-          # Fix for the previous run's failure:
-          #   "Unable to remote fetch project external/libarchive"
-          #
-          # The current upstream fox.xml adds a batch of brand-new OrangeFox
-          # projects (rclone / fox-go / libfuse3 / libarchive / ...) and pins
-          # several of them to raw commit SHAs on gitlab.com/OrangeFox repos
-          # that are NOT anonymously fetchable (verified 2026-10-19 via
-          # git ls-remote and the GitLab API):
-          #     external/libarchive -> git asks for credentials (API: 404)
-          #     external/libfuse3   -> git HTTP 403
-          #     external/fox-go     -> git asks for credentials
-          #     external/icu        -> git HTTP 403
-          # OrangeFox's own CI fetches these with authentication; an anonymous
-          # GitHub Actions runner cannot, so repo sync aborts on the first of
-          # them (libarchive). The other three would have failed next - the
-          # old --fail-fast run simply never got that far.
-          #
-          # Verified safe to drop (2026-10-19): a full-source grep of the
-          # CURRENT bootable/recovery@fox_16.0, vendor/recovery@main and
-          # vendor/twrp@fox_16.0 trees finds ZERO build-graph references to
-          # any of the four projects (the rclone feature rollout has not
-          # wired them into the build system yet). external/rclone itself IS
-          # public and its branch tip equals the pinned SHA - it stays.
-          #
-          # The removal overlay below is generated DYNAMICALLY: only entries
-          # that actually exist in the current manifest are removed, so the
-          # overlay self-adapts when upstream changes (makes a repo public
-          # again, or drops it from fox.xml).
-          #
-          # History, kept for future debugging:
-          #  * The manifest chain (default.xml -> twrp-default.xml -> fox.xml
-          #    + remove-minimal.xml) already slims itself to ~400 projects.
-          #    NEVER add our own copy of remove-minimal.xml as an overlay:
-          #    duplicate removals abort the whole sync (older failure).
-          #  * AOSP 16 lunch requires 3-part targets and has no interactive
-          #    menu - handled in the build step below.
-          # -----------------------------------------------------------------
-          if repo manifest -o /tmp/base_manifest.xml >/dev/null 2>/tmp/manifest_check.err; then
-            echo "Manifest parse: OK ($(grep -c '<project ' /tmp/base_manifest.xml) projects from upstream manifest)"
-          else
-            echo "WARNING: upstream manifest does not parse cleanly. Upstream hiccup?"
-            sed -n '1,5p' /tmp/manifest_check.err
-            echo "Attempting auto-fix for dangling <remove-project> entries..."
-            for ATTEMPT in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-              BAD=$(sed -n 's/.*non-existent project: \(<remove-project[^>]*\/>\).*/\1/p' /tmp/manifest_check.err | head -n1)
-              if [ -z "$BAD" ]; then
-                echo "No dangling remove-project identified; stopping auto-fix."
-                break
-              fi
-              echo "  stripping dangling entry: $BAD"
-              BAD="$BAD" python3 - <<'PYEOF'
-          import os, re, glob
-          bad = os.environ["BAD"]
-          m_path = re.search(r'path="([^"]*)"', bad)
-          m_name = re.search(r'name="([^"]*)"', bad)
-          key = (m_path.group(1) if m_path else None) or (m_name.group(1) if m_name else None)
-          if not key:
-              raise SystemExit(0)
-          for f in glob.glob(".repo/manifests/*.xml"):
-              try:
-                  with open(f, encoding="utf-8", errors="replace") as fh:
-                      lines = fh.readlines()
-              except OSError:
-                  continue
-              kept = [l for l in lines if not ("remove-project" in l and key in l)]
-              if len(kept) != len(lines):
-                  with open(f, "w", encoding="utf-8") as fh:
-                      fh.writelines(kept)
-                  print(f"    stripped from {f}")
-          PYEOF
-              if repo manifest -o /tmp/base_manifest.xml >/dev/null 2>/tmp/manifest_check.err; then
-                echo "  manifest parses cleanly now."
-                break
-              fi
-            done
-            # Commit the edit so the manifests worktree stays clean when
-            # repo sync updates the manifests project (it rebases).
-            git -C .repo/manifests add -A >/dev/null 2>&1 || true
-            git -C .repo/manifests commit -qm "CI: strip dangling remove-project entries" >/dev/null 2>&1 || true
-            if ! repo manifest -o /tmp/base_manifest.xml >/dev/null 2>/tmp/manifest_check.err; then
-              echo "ERROR: manifest still unparseable after auto-fix. Full error:"
-              cat /tmp/manifest_check.err
-              exit 1
-            fi
-            echo "Manifest parse: OK after auto-fix ($(grep -c '<project ' /tmp/base_manifest.xml) projects)"
-          fi
-
-          # Generate a local-manifest overlay removing the OrangeFox projects
-          # that are currently not anonymously fetchable (see comment above).
-          mkdir -p .repo/local_manifests
-          python3 - <<'PYEOF'
-          import xml.etree.ElementTree as ET
-
-          # Manifest names of projects pinned by upstream fox.xml to repos
-          # that reject anonymous fetches (HTTP 401/403, verified 2026-10-19).
-          UNFETCHABLE = [
-              "external/libarchive",
-              "external/libfuse3",
-              "external/fox-go",
-              "external/icu",
-          ]
-
-          base = ET.parse("/tmp/base_manifest.xml").getroot()
-          present = {p.get("name") for p in base.iter("project")}
-          victims = [n for n in UNFETCHABLE if n in present]
-          skipped = [n for n in UNFETCHABLE if n not in present]
-          if skipped:
-              print("Overlay: not in current manifest (skipped): %s" % ", ".join(skipped))
-          with open(".repo/local_manifests/ci-remove-unfetchable.xml", "w", encoding="utf-8") as fh:
-              fh.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-              fh.write("<!-- CI: these OrangeFox repos are not anonymously fetchable\n")
-              fh.write("     (HTTP 401/403, verified 2026-10-19) and no consumer in\n")
-              fh.write("     the recovery build graph references them yet, so repo\n")
-              fh.write("     sync would abort on them. Details in the sync step. -->\n")
-              fh.write("<manifest>\n")
-              for n in victims:
-                  fh.write('  <remove-project name="%s"/>\n' % n)
-              fh.write("</manifest>\n")
-          if victims:
-              print("Overlay: removing unfetchable projects: %s" % ", ".join(victims))
-          else:
-              print("Overlay: nothing to remove (upstream may have fixed access)")
-          PYEOF
-
-          # Re-parse the EFFECTIVE manifest (overlay applied) before the long
-          # sync, so structural mistakes fail in seconds instead of minutes.
-          if ! repo manifest -o /tmp/combined_manifest.xml >/dev/null 2>/tmp/manifest_check.err; then
-            echo "ERROR: effective manifest does not parse after the overlay:"
-            cat /tmp/manifest_check.err
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global color.ui false
+          mkdir -p ~/bin "$SRC"
+          curl -sSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo
+          chmod a+x ~/bin/repo
+          export PATH="$HOME/bin:$PATH"
+          cd "$SRC"
+          ok=0
+          for i in 1 2 3; do
+            echo "=== repo init attempt $i ==="
+            if repo init -u "$MANIFEST_URL" -b "$MANIFEST_BRANCH"; then ok=1; break; fi
+            echo "repo init failed (GitLab throttling?) - retrying"
+            sleep 20
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::repo init failed after 3 attempts"
             exit 1
           fi
-          echo "Effective manifest: $(grep -c '<project ' /tmp/combined_manifest.xml) projects (unfetchable ones removed)"
+          mkdir -p .repo/local_manifests
+          cat > .repo/local_manifests/malachite.xml <<XML
+          <?xml version="1.0" encoding="UTF-8"?>
+          <manifest>
+            <remote name="ghdev" fetch="https://github.com/" />
+            <project path="device/xiaomi/malachite" name="${DT_REPO}" remote="ghdev" revision="${DT_BRANCH}" />
+          </manifest>
+          XML
+          cat .repo/local_manifests/malachite.xml
 
-          # Pre-flight: probe every OrangeFox-remote project for anonymous
-          # reachability. Warning-only on purpose: GitLab throttles bursts of
-          # anonymous requests, so a WARN here may be transient - but if the
-          # sync below fails on the same project, this table explains why
-          # instantly (private/unpublished upstream repo).
-          python3 - <<'PYEOF'
-          import subprocess, time, urllib.parse
-          import xml.etree.ElementTree as ET
+      # ------------------------------------------------------------------
+      # Step 4 - repo sync, parse-guarded and throttling-tolerant:
+      #          (a) base manifest parse-check with dangling-remove auto-fix
+      #          (b) dynamic overlay for unfetchable private repos
+      #          (c) effective re-parse + warning-only pre-flight probes
+      #          (d) sync retry ladder
+      # ------------------------------------------------------------------
+      - name: Sync OrangeFox source tree (parse-guarded, throttling-tolerant)
+        run: |
+          export PATH="$HOME/bin:$PATH"
+          cd "$SRC"
 
-          root = ET.parse("/tmp/combined_manifest.xml").getroot()
-          remotes = {r.get("name"): r.get("fetch") for r in root.iter("remote")}
-          targets = []
-          for p in root.iter("project"):
-              if p.get("remote") == "OrangeFox":
-                  url = urllib.parse.urljoin("%s/" % remotes.get("OrangeFox", ""), p.get("name"))
-                  targets.append((p.get("name"), url))
-          print("Pre-flight: probing %d OrangeFox-remote projects (anonymous)..." % len(targets))
-          bad = []
-          for name, url in targets:
+          # ---------- (a) base manifest parse-check + auto-fix ----------
+          fixes=0
+          until repo manifest -o /tmp/manifest_effective.xml >/tmp/manifest_check.log 2>&1; do
+            cat /tmp/manifest_check.log || true
+            BAD=$(grep -Eo 'remove-project element specifies non-existent project: .+' /tmp/manifest_check.log \
+                  | head -n1 | sed -E 's/.*\b(name|path)="([^"]+)".*/\2/' || true)
+            if [ -z "$BAD" ] || [ "$fixes" -ge 20 ]; then
+              echo "::error::manifest does not parse and no auto-fix is available"
+              exit 1
+            fi
+            echo "auto-fix: stripping dangling remove-project '$BAD'"
+            for f in .repo/manifests/*.xml; do
+              python3 - "$f" "$BAD" <<'PY'
+          import sys, re
+          path, bad = sys.argv[1], sys.argv[2]
+          s = open(path).read()
+          pat = re.compile(r'\n?[ \t]*<remove-project\b[^>]*\b(?:name|path)="' + re.escape(bad) + r'"[^>]*/>[ \t]*')
+          new = pat.sub('\n', s)
+          if new != s:
+              open(path, 'w').write(new)
+              print(f'stripped from {path}')
+          PY
+              git -C .repo/manifests add -A >/dev/null 2>&1 || true
+              git -C .repo/manifests commit -qm "ci: drop dangling remove-project $BAD" >/dev/null 2>&1 || true
+            done
+            fixes=$((fixes + 1))
+          done
+          echo "Manifest parse: OK ($(grep -c '<project ' /tmp/manifest_effective.xml) projects)"
+
+          # ---------- (b) overlay: unfetchable OrangeFox repos ----------
+          # fox.xml pins some new rclone-rollout feature repos to raw SHAs on
+          # gitlab.com/OrangeFox repos that are NOT anonymously fetchable, and
+          # nothing in the current bootable/recovery + vendor/* build graph
+          # references them. Remove them dynamically (intersected with what is
+          # actually present, so this overlay can never dangle).
+          cat > /tmp/unfetchable.txt <<'EOF'
+          external/libarchive
+          external/libfuse3
+          external/icu
+          external/fox-go
+          EOF
+          python3 - <<'PY'
+          import os, re
+          eff = open('/tmp/manifest_effective.xml').read()
+          names = set(re.findall(r'<project\b[^>]*\bname="([^"]+)"', eff))
+          cands = [l.strip() for l in open('/tmp/unfetchable.txt') if l.strip()]
+          present = [c for c in cands if c in names]
+          lines = [
+              '<?xml version="1.0" encoding="UTF-8"?>',
+              '<!-- CI: drop OrangeFox feature repos pinned to privately-fetchable',
+              '     revisions (rclone rollout not wired into the build graph yet). -->',
+              '<manifest>',
+          ]
+          for p in present:
+              lines.append(f'    <remove-project name="{p}" />')
+          lines.append('</manifest>')
+          os.makedirs('.repo/local_manifests', exist_ok=True)
+          open('.repo/local_manifests/ci-remove-unfetchable.xml', 'w').write('\n'.join(lines) + '\n')
+          print('ci-remove-unfetchable overlay removes:', present if present else 'nothing')
+          PY
+          cat .repo/local_manifests/ci-remove-unfetchable.xml
+
+          # ---------- (c) effective re-parse + pre-flight probes ----------
+          if ! repo manifest -o /tmp/manifest_effective2.xml >/tmp/manifest_check2.log 2>&1; then
+            cat /tmp/manifest_check2.log || true
+            echo "::error::effective manifest (with overlay) does not parse"
+            exit 1
+          fi
+          echo "Effective manifest: OK ($(grep -c '<project ' /tmp/manifest_effective2.xml) projects)"
+          # Warning-only: GitLab throttles anonymous bursts, so treat this as
+          # diagnostics, never as a gate.
+          python3 - <<'PY'
+          import re, subprocess
+          eff = open('/tmp/manifest_effective2.xml').read()
+          projs = re.findall(r'<project\b[^>]*\bname="([^"]+)"[^>]*\bremote="([^"]+)"', eff)
+          fox = [n for n, r in projs if r == 'OrangeFox']
+          print(f'pre-flight: probing {len(fox)} OrangeFox-remote projects (warning-only)')
+          unreachable = []
+          for n in fox:
               ok = False
-              for attempt in range(3):
-                  if subprocess.run(["git", "ls-remote", url], capture_output=True).returncode == 0:
+              for _ in range(3):
+                  r = subprocess.run(['git', 'ls-remote', '--exit-code',
+                                      'https://gitlab.com/OrangeFox/' + n, 'HEAD'],
+                                     capture_output=True)
+                  if r.returncode == 0:
                       ok = True
                       break
-                  time.sleep(3)
+                  subprocess.run(['sleep', '3'])
               if not ok:
-                  bad.append(name)
-                  print("  WARN not anonymously fetchable: %s (%s)" % (name, url))
-          if bad:
-              print("WARNING: %d OrangeFox repo(s) unreachable anonymously: %s" % (len(bad), ", ".join(bad)))
-              print("If repo sync fails on one of these, the repo is private/unpublished upstream.")
-          else:
-              print("Pre-flight: all OrangeFox-remote projects reachable.")
-          PYEOF
+                  unreachable.append(n)
+          for n in unreachable:
+              print(f'::warning::unfetchable OrangeFox repo: {n}')
+          if not unreachable:
+              print('pre-flight: all reachable')
+          PY
 
-          # Incremental retry ladder: attempt 2 and 3 only fetch whatever is
-          # still missing, and dropping --fail-fast lets repo keep going on
-          # unrelated projects while one connection hiccups.
-          repo sync -c -j8 --no-tags --fail-fast \
-            || repo sync -c -j4 --no-tags --force-sync \
-            || repo sync -c -j2 --no-tags --force-sync
+          # ---------- (d) sync retry ladder ----------
+          set +e
+          ok=0
+          echo "=== repo sync attempt 1: -j8 --fail-fast ==="
+          repo sync -c -j8 --fail-fast
+          rc=$?
+          if [ $rc -eq 0 ]; then
+            ok=1
+          else
+            echo "=== repo sync attempt 2: -j4 --force-sync (incremental) ==="
+            repo sync -c -j4 --force-sync --no-clone-bundle --no-tags
+            rc=$?
+            if [ $rc -eq 0 ]; then
+              ok=1
+            else
+              echo "=== repo sync attempt 3: -j2 --force-sync (incremental) ==="
+              repo sync -c -j2 --force-sync --no-clone-bundle --no-tags
+              rc=$?
+              if [ $rc -eq 0 ]; then ok=1; fi
+            fi
+          fi
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::repo sync failed at every ladder level (last rc=$rc)"
+            exit 1
+          fi
+          set -e
 
-          # Post-sync early-warning for upstream drift: if the OrangeFox build
-          # system ever starts referencing the removed projects, print it here
-          # so a future failure is self-explaining (they would then have to
-          # be substituted from public sources instead of removed).
-          if grep -rEl 'libarchive|libfuse3|fox-go' --include='Android.bp' --include='*.mk' \
-               bootable/recovery vendor/recovery vendor/twrp 2>/dev/null | head -n 5 | grep -q .; then
-            echo "WARNING: the recovery build system now references removed projects:"
-            grep -rEl 'libarchive|libfuse3|fox-go' --include='Android.bp' --include='*.mk' \
-              bootable/recovery vendor/recovery vendor/twrp 2>/dev/null | head -n 5
-            echo "Upstream wired them in - the removal overlay must be revisited."
+          # Drift early-warning: if upstream later wires the removed repos into
+          # the build graph, say so loudly in the log.
+          if grep -rEl "libarchive|libfuse3|fox-go" bootable/recovery vendor/recovery vendor/twrp \
+               --include='*.bp' --include='*.mk' 2>/dev/null \
+               | grep -Ev "libfusesideload|libfusetwrp" ; then
+            echo "::warning::upstream now references removed projects - review ci-remove-unfetchable.xml"
+          else
+            echo "drift check: no references to removed projects (good)"
           fi
-          if [ ! -d external/rclone ]; then
-            echo "NOTE: external/rclone absent (upstream manifest change) - informational only."
-          fi
-          echo "Sync finished: $(date -u). Disk usage:"
           df -h /
+          du -sh .repo 2>/dev/null || true
 
+      # ------------------------------------------------------------------
+      # Step 5 - tolerant verify of the synced tree
+      # ------------------------------------------------------------------
       - name: Verify synced tree
         run: |
           set -e
-          cd workspace/fox_16.0
+          cd "$SRC"
           FAIL=0
-          # Mandatory entries: the build cannot proceed without them.
-          if [ ! -f build/envsetup.sh ]; then
-            echo "ERROR: build/envsetup.sh is missing. repo sync did not complete correctly."
-            FAIL=1
-          fi
-          if [ ! -f vendor/twrp/config/common.mk ]; then
-            echo "ERROR: vendor/twrp/config/common.mk is missing (inherited by the device tree)."
-            FAIL=1
-          fi
-          if [ ! -d vendor/recovery ]; then
-            echo "ERROR: vendor/recovery is missing (OrangeFox build system layer)."
-            FAIL=1
-          fi
-          if [ "$FAIL" -eq 1 ]; then exit 1; fi
-          # Informational only: a root-level vendorsetup.sh is a legacy AOSP artifact.
-          # fox_16.0 does NOT ship one and does NOT need it — product discovery is
-          # done through AndroidProducts.mk. Never fail the build over it.
+          for p in build/envsetup.sh vendor/twrp/config/common.mk vendor/recovery bootable/recovery device/xiaomi/malachite; do
+            if [ -e "$p" ]; then echo "OK   $p"; else echo "::error::missing $p"; FAIL=1; fi
+          done
           if [ ! -f vendorsetup.sh ]; then
-            echo "NOTE: root vendorsetup.sh is absent — normal for fox_16.0, continuing."
+            echo "note: no legacy root vendorsetup.sh (normal on fox_16.0)"
           fi
-          echo "Synced tree verified."
-          ls | head -20
+          ls -l device/xiaomi/malachite/prebuilt/dtb || { echo "::error::prebuilt dtb missing"; FAIL=1; }
+          ls -l device/xiaomi/malachite/recovery/root/system/etc/recovery.fstab || true
+          if [ "$FAIL" -ne 0 ]; then exit 1; fi
 
-      - name: Prepare device tree
+      # ------------------------------------------------------------------
+      # Step 6 - fox-ify the device tree:
+      #   a) vendorsetup.sh contract (FOX_* build vars; OrangeFox envsetup
+      #      sources every device tree's vendorsetup.sh)
+      #   b) fox_malachite.mk with OF_* UI flags (official amethyst template)
+      #   c) wire fox_malachite.mk into twrp_malachite.mk
+      #   d) drop modules removed in Android 16 (keymaster HAL 3.0)
+      #   e) apply the proven minuitwrp haptics patch when applicable
+      # ------------------------------------------------------------------
+      - name: Fox-ify device tree (contract + flags + patch)
         run: |
           set -e
-          cd "$GITHUB_WORKSPACE/workspace/fox_16.0"
-          git clone --depth=1 -b "$DEVICE_TREE_BRANCH" "$DEVICE_TREE_URL" "$DEVICE_PATH"
-          echo "Device tree cloned:"
-          ls -la "$DEVICE_PATH"
+          cd "$SRC"
+          DEV="device/xiaomi/malachite"
 
-      - name: Apply device patches to bootable/recovery
-        run: |
-          set -e
-          REPO_DIR="$GITHUB_WORKSPACE/workspace/fox_16.0"
-          PATCH="$REPO_DIR/$DEVICE_PATH/patches/0001-minuitwrp-skip-unavailable-aidl-haptics.patch"
-          if [ ! -f "$PATCH" ]; then
-            echo "No patch present, skipping."
-            exit 0
-          fi
-          # Required per the device tree README: prevents an optional vibration
-          # request from blocking the touch interface before servicemanager is up.
-          if git -C "$REPO_DIR/bootable/recovery" apply --check "$PATCH" 2>/dev/null; then
-            git -C "$REPO_DIR/bootable/recovery" apply "$PATCH"
-            echo "Haptics patch applied to bootable/recovery."
-          elif patch -d "$REPO_DIR/bootable/recovery" -p1 --forward --dry-run < "$PATCH" >/dev/null 2>&1; then
-            patch -d "$REPO_DIR/bootable/recovery" -p1 --forward < "$PATCH"
-            echo "Haptics patch applied with patch(1)."
+          # (a) vendorsetup.sh - official fox_16.0 device-tree contract
+          cat > "$DEV/vendorsetup.sh" <<'VSEOF'
+          #!/bin/bash
+          # CI-generated OrangeFox build vars for malachite (Redmi Note 14 Pro 5G)
+          # Template: official fox_16.0 device trees (chkndrp/amethyst pattern)
+          FDEVICE="malachite"
+
+          fox_get_target_device() {
+              local src=""
+              if [ -n "$ZSH_VERSION" ]; then src="${(%):-%x}"
+              elif [ -n "$BASH_VERSION" ]; then src="${BASH_SOURCE[0]}"
+              else src="$0"; fi
+              if echo "$src" | grep -q "$FDEVICE"; then FOX_BUILD_DEVICE="$FDEVICE"
+              elif [ -n "$BASH_VERSION" ] && set | grep BASH_ARGV | grep -q -w "$FDEVICE"; then FOX_BUILD_DEVICE="$FDEVICE"
+              elif echo "$* $0" | grep -q -w "$FDEVICE"; then FOX_BUILD_DEVICE="$FDEVICE"
+              fi
+          }
+
+          if [ -z "$1" ] && [ -z "$FOX_BUILD_DEVICE" ]; then fox_get_target_device "$@"; fi
+
+          if [ "$1" = "$FDEVICE" ] || [ "$FOX_BUILD_DEVICE" = "$FDEVICE" ]; then
+              export TARGET_DEVICE_ALT="malachite"
+              # Binaries & tools
+              export FOX_USE_BUSYBOX_BINARY=1
+              export FOX_USE_BASH_SHELL=1
+              export FOX_USE_TAR_BINARY=1
+              export FOX_USE_SED_BINARY=1
+              export FOX_USE_XZ_UTILS=1
+              export FOX_USE_ZSTD_BINARY=1
+              export FOX_USE_LZ4_BINARY=1
+              export FOX_USE_DATE_BINARY=1
+              export FOX_USE_FSCK_EROFS_BINARY=1
+              export FOX_USE_PATCHELF_BINARY=1
+              export FOX_USE_GREP_BINARY=1
+              export FOX_ASH_IS_BASH=1
+              export FOX_BASH_TO_SYSTEM_BIN=1
+              export FOX_REPLACE_TOOLBOX_GETPROP=1
+              # Settings / data storage
+              export FOX_SETTINGS_ROOT_DIRECTORY="/data/recovery"
+              export FOX_MISCELLANEOUS_ROOT_DIRECTORY="/sdcard"
+              export FOX_ALLOW_EARLY_SETTINGS_LOAD=1
+              # Addons
+              export FOX_ENABLE_APP_MANAGER=1
+              export FOX_DELETE_AROMAFM=1
+              export FOX_NO_BLANK_DT2W=1
+              # Magisk / KernelSU(-Next) / SukiSU support
+              export FOX_ENABLE_KERNELSU_SUPPORT=1
+              export FOX_ENABLE_KERNELSU_NEXT_SUPPORT=1
+              export FOX_ENABLE_SUKISU_SUPPORT=1
+              export FOX_MOVE_MAGISK_INSTALLER_TO_RAMDISK=1
+              # A/B partitioning
+              export FOX_VIRTUAL_AB_DEVICE=1
+              export FOX_RECOVERY_SYSTEM_PARTITION="/dev/block/mapper/system"
+              export FOX_RECOVERY_VENDOR_PARTITION="/dev/block/mapper/vendor"
+              # Modern magiskboot for a recent device
+              export FOX_USE_UPDATED_MAGISKBOOT=1
+              # CI: single-shot build, no ccache
+              export USE_CCACHE=0
+              export LC_ALL="C"
+              export BUILD_USERNAME=ci-builder
+              export BUILD_HOSTNAME=orangefox
           else
-            echo "WARNING: patch does not apply cleanly (likely already fixed upstream). Continuing."
+              if [ -z "$FOX_BUILD_DEVICE" ] && [ -z "$BASH_SOURCE" ] && [ -z "$ZSH_VERSION" ]; then
+                  echo "W: This script requires bash or zsh. Not processing $FDEVICE"
+              fi
           fi
+          VSEOF
+          chmod +x "$DEV/vendorsetup.sh"
 
-      - name: Add OrangeFox device configuration
-        run: |
-          set -e
-          REPO_DIR="$GITHUB_WORKSPACE/workspace/fox_16.0"
-          # Pattern taken from the official OrangeFox fox_16.0 reference tree
-          # (device/xiaomi/mondrian), adapted for an A/B vendor_boot-only device:
-          # no OF_AB_DEVICE_WITH_RECOVERY_PARTITION here, because malachite has
-          # no dedicated recovery partition (recovery lives in vendor_boot).
-          cat >> "$REPO_DIR/$DEVICE_PATH/BoardConfig.mk" <<EOF
+          # (b) fox_malachite.mk - OrangeFox UI/build flags
+          cat > "$DEV/fox_malachite.mk" <<'FOXEOF'
+          # OrangeFox-specific flags for malachite (CI-generated).
+          # Reference: official fox_16.0 device trees (chkndrp/amethyst).
+          OF_MAINTAINER := UNOFFICIAL-malachite
 
-          # ---- OrangeFox Recovery (fox_16.0) ----
-          OF_AB_DEVICE := 1
+          # Screen settings (1220x2712)
           OF_SCREEN_H := 2712
+          OF_STATUS_H := 100
           OF_STATUS_INDENT_LEFT := 48
           OF_STATUS_INDENT_RIGHT := 48
+          OF_ALLOW_DISABLE_NAVBAR := 0
           OF_CLOCK_POS := 1
+          OF_OPTIONS_LIST_NUM := 9
+
+          # Quick backup (recovery itself lives in vendor_boot on this device)
+          OF_QUICK_BACKUP_LIST := /vendor_boot;/persist_image;
+
+          # Flashlight & LEDs
+          OF_FL_PATH1 := /tmp/of_torch
+          OF_USE_GREEN_LED := 0
+
+          # Security (disables MTP & ADB during password prompt)
           OF_ADVANCED_SECURITY := 1
-          OF_MAINTAINER := "$MAINTAINER"
-          EOF
-          echo "OrangeFox configuration appended:"
-          tail -12 "$REPO_DIR/$DEVICE_PATH/BoardConfig.mk"
-          # Official fox_16.0 device trees ship a vendorsetup.sh that exports
-          # the device's FOX_* build variables (bash shell, nano editor, app
-          # manager, virtual A/B, ...). The manifest already syncs the official
-          # reference tree (device/xiaomi/mondrian), so derive malachite's copy
-          # from it — that keeps the pattern byte-identical to the proven
-          # reference. Only the device name needs replacing.
-          if [ -f "$REPO_DIR/device/xiaomi/mondrian/vendorsetup.sh" ]; then
-            sed 's/FDEVICE="mondrian"/FDEVICE="malachite"/' \
-              "$REPO_DIR/device/xiaomi/mondrian/vendorsetup.sh" \
-              > "$REPO_DIR/$DEVICE_PATH/vendorsetup.sh"
-            echo "Created $DEVICE_PATH/vendorsetup.sh (official OrangeFox pattern):"
-            tail -20 "$REPO_DIR/$DEVICE_PATH/vendorsetup.sh"
+
+          # A/B partitioning
+          OF_VAB_ORS_WIPE_DATA_IS_FORMAT := 1
+          OF_ENABLE_ALL_PARTITION_TOOLS := 1
+
+          # Workarounds
+          OF_LOOP_DEVICE_ERRORS_TO_LOG := 1
+          OF_NO_TREBLE_COMPATIBILITY_CHECK := 1
+          OF_USE_LEGACY_TIME_FIXUP := 1
+
+          # Data / Metadata (f2fs userdata)
+          OF_WIPE_METADATA_AFTER_DATAFORMAT := 1
+          OF_UNBIND_SDCARD_F2FS := 1
+          OF_FORCE_CASEFOLDING := 1
+          OF_USE_DMCTL := 1
+
+          # FRP reset addon
+          OF_ENABLE_FRP_ADDON := 1
+          FOXEOF
+
+          # (c) wire fox_malachite.mk into the product chain
+          python3 - "$DEV/twrp_malachite.mk" <<'PY'
+          import sys
+          p = sys.argv[1]
+          s = open(p).read()
+          if 'fox_malachite.mk' not in s:
+              line = ('# Import OrangeFox specifics\n'
+                      '$(call inherit-product, $(DEVICE_PATH)/fox_malachite.mk)')
+              anchor = '$(call inherit-product, $(DEVICE_PATH)/device.mk)'
+              if anchor in s:
+                  s = s.replace(anchor, anchor + '\n\n' + line, 1)
+              else:
+                  s = s.rstrip() + '\n\n' + line + '\n'
+              open(p, 'w').write(s)
+              print('fox_malachite.mk wired into twrp_malachite.mk')
+          else:
+              print('fox_malachite.mk already wired')
+          PY
+
+          # (d) Android 16 removed the keymaster HAL 3.0 module; the tree was
+          #     written against TWRP 14.1. Drop it or soong will refuse to run.
+          sed -i '/keymaster@3\.0/d' "$DEV/device.mk"
+
+          # (e) haptics patch proven against TeamWin android-14.1; apply only
+          #     when it still fits the fox_16.0 recovery sources.
+          if git -C bootable/recovery apply --check \
+               "$DEV/patches/0001-minuitwrp-skip-unavailable-aidl-haptics.patch" 2>/dev/null; then
+            git -C bootable/recovery apply \
+              "$DEV/patches/0001-minuitwrp-skip-unavailable-aidl-haptics.patch"
+            echo "haptics patch applied"
           else
-            echo "WARNING: official reference vendorsetup.sh not found in the sync;"
-            echo "         continuing without FOX_* environment setup."
+            echo "haptics patch not applicable on this base - skipped (expected on fox_16.0)"
           fi
 
-      - name: Strip non-essential files from the device tree
-        run: |
-          set -e
-          cd "$GITHUB_WORKSPACE/workspace/fox_16.0/$DEVICE_PATH"
-          # Housekeeping before building: docs, metadata and the (already
-          # applied) patch set are not needed by the build system.
-          rm -rf .git .github README.md docs patches
-          echo "Device tree after cleanup:"
-          ls -la
+          echo "=== fox-ified tree summary ==="
+          ls -l "$DEV/vendorsetup.sh" "$DEV/fox_malachite.mk"
+          grep -n "fox_malachite" "$DEV/twrp_malachite.mk"
 
-      - name: Build vendor_boot image
+      # ------------------------------------------------------------------
+      # Step 7 - build the vendor_boot image
+      #   anti-OOM: GOMEMLIMIT (Go heap cap for soong_build), -j2, retries
+      #   with automatic "missing module" repair and OOM evidence dumps.
+      # ------------------------------------------------------------------
+      - name: Build vendor_boot image (anti-OOM + auto-retry)
         run: |
-          cd "$GITHUB_WORKSPACE/workspace/fox_16.0"
-          echo "Build step started: $(date -u)"
-          # If the runner ever terminates this step (SIGTERM -> exit code 143),
-          # record a resource snapshot so the cause (disk, memory, timeout)
-          # is visible in the log instead of a bare 143.
-          trap 'echo "=== Step received termination signal at $(date -u) ==="; df -h /; free -h; ps -eo pid,pcpu,pmem,rss,comm --sort=-rss | head -n 15' TERM INT
-          # Resource snapshot for the record: this is the phase where a previous
-          # run died with an unexplained exit code 143.
-          echo "=== Resources before build ==="
-          nproc
-          free -h
-          df -h /
-          # Product name comes from the device tree's AndroidProducts.mk
-          # (fox_16.0 convention keeps the TWRP-style name, e.g. twrp_malachite).
-          PRODUCT=$(grep -m1 -oE '(twrp|fox|omni)_[A-Za-z0-9_]+' "$DEVICE_PATH/AndroidProducts.mk" | head -n1)
-          if [ -z "$PRODUCT" ]; then
-            echo "ERROR: could not detect the product name in $DEVICE_PATH/AndroidProducts.mk"
-            exit 1
-          fi
-          echo "Building product: $PRODUCT"
-
-          # IMPORTANT: never source envsetup with errexit (`set -e`) active.
-          # GitHub Actions enables errexit by default. The OrangeFox envsetup
-          # scans and sources every synced device tree's vendorsetup.sh, and
-          # those scripts contain code paths that legitimately return a
-          # non-zero status. Disable errexit here and validate each stage
-          # explicitly instead.
+          export PATH="$HOME/bin:$PATH"
+          cd "$SRC"
+          LOG=/tmp/build.log
+          START=$(date +%s)
           set +e
+
+          # OrangeFox envsetup scans and sources every device tree's
+          # vendorsetup.sh; the no-match path returns non-zero, which is
+          # benign but would kill a `bash -e` step - hence set +e.
           source build/envsetup.sh
-          echo "envsetup sourced (exit code: $?)"
+          echo "envsetup rc=$? (non-zero tolerated; validated via lunch below)"
 
-          # -------------------------------------------------------------------
-          # AOSP 16 lunch semantics (fox_16.0 is pinned to android-16.0.0_r1):
-          #   * lunch accepts EITHER the positional form
-          #       'lunch <product> <release> <variant>'
-          #     OR the legacy form 'lunch <product>-<release>-<variant>'
-          #     (exactly 3 dash-separated parts required).
-          #   * 2-part combos like 'twrp_malachite-eng' are REJECTED with
-          #     "Invalid lunch combo" — that is why previous builds died here.
-          #   * The interactive lunch menu was REMOVED ('lunch' with no args
-          #     only prints "No target specified"), so there is nothing to parse.
-          #   * add_lunch_combo is obsolete; COMMON_LUNCH_CHOICES in
-          #     AndroidProducts.mk is what the build system uses (the device
-          #     tree already ships it).
-          # Release configs shipped at android-16.0.0_r1
-          # (platform/build/release/release_configs/): ap2a ap3a ap4a bp1a bp2a,
-          # plus trunk_staging as the default development config.
-          # release_config_map.textproto does NOT gate releases per product,
-          # so every config above is valid for twrp_malachite.
-          # 'ap2a' is tried first because that is the release the device tree
-          # author's own build instructions were verified with.
-          # -------------------------------------------------------------------
-          echo "Release configs available in the synced tree:"
-          ls build/release/release_configs/ 2>/dev/null | sed 's/^/  /' || echo "  (not found, relying on candidate list)"
-
-          CANDIDATES="ap2a trunk_staging bp2a bp1a ap4a ap3a"
-          # Prefer dynamically discovered releases when the helper exists
-          # (build/soong/bin is added to PATH by sourcing envsetup).
-          if command -v list_releases >/dev/null 2>&1; then
-            DISCOVERED=$(list_releases "$PRODUCT" 2>/dev/null | tr '\n' ' ')
-            if [ -n "$DISCOVERED" ]; then
-              echo "list_releases $PRODUCT -> $DISCOVERED"
-              CANDIDATES="$DISCOVERED $CANDIDATES"
-            fi
-          fi
-
-          LUNCHED=0
-          for REL in $CANDIDATES; do
-            echo "Trying: lunch $PRODUCT-$REL-eng"
-            lunch "$PRODUCT-$REL-eng" > "/tmp/lunch_$REL.log" 2>&1
-            RC=$?
-            if [ "$RC" -eq 0 ]; then
-              echo "Lunch OK: $PRODUCT-$REL-eng"
-              echo "TARGET_PRODUCT=$TARGET_PRODUCT TARGET_RELEASE=$TARGET_RELEASE TARGET_BUILD_VARIANT=$TARGET_BUILD_VARIANT"
-              LUNCHED=1
+          # fox_16.0 = Android 16 (bp2a). Ladder ordered: official convention
+          # first, then every other release config known to exist.
+          REL_LIST="bp2a ap2a ap4a bp1a ap3a trunk_staging"
+          TARGET_LUNCH=""
+          for R in $REL_LIST; do
+            if ( lunch "twrp_malachite-$R-eng" ) >/tmp/lunch_$R.log 2>&1; then
+              TARGET_LUNCH="twrp_malachite-$R-eng"
               break
             else
-              echo "  failed (exit code $RC). Log tail:"
-              tail -n 15 "/tmp/lunch_$REL.log" | sed 's/^/    /'
+              echo "lunch twrp_malachite-$R-eng failed:"
+              tail -n 5 /tmp/lunch_$R.log || true
             fi
           done
-
-          if [ "$LUNCHED" -ne 1 ]; then
-            echo "ERROR: no release config worked for $PRODUCT. Tried: $CANDIDATES"
+          if [ -z "$TARGET_LUNCH" ]; then
+            echo "all release candidates failed - removing TWRP-14.1 PLATFORM_VERSION spoof and retrying"
+            sed -i -e '/^PLATFORM_VERSION := 99/d' -e '/^PLATFORM_VERSION_LAST_STABLE/d' \
+              device/xiaomi/malachite/BoardConfig.mk
+            for R in $REL_LIST; do
+              if ( lunch "twrp_malachite-$R-eng" ) >/tmp/lunch2_$R.log 2>&1; then
+                TARGET_LUNCH="twrp_malachite-$R-eng"
+                break
+              fi
+            done
+          fi
+          if [ -z "$TARGET_LUNCH" ]; then
+            echo "::error::no lunchable product/release combo"
+            tail -n 60 /tmp/lunch_*.log 2>/dev/null || true
             exit 1
           fi
+          echo "TARGET_LUNCH=$TARGET_LUNCH"
+          lunch "$TARGET_LUNCH"
 
-          mka "$BUILD_TARGET" 2>&1 | tee /tmp/mka.log
-          BUILD_RC=${PIPESTATUS[0]}
+          echo "=== resource snapshot before build ==="
+          free -h || true
+          df -h / || true
+          trap 'echo "=== TERM/INT received ==="; df -h /; free -h; ps aux --sort=-%mem | head -n 8' TERM INT
 
-          # Termination-class failures (143=SIGTERM, 137=SIGKILL) are often
-          # transient on hosted runners. Soong/kati resume incrementally, so a
-          # single retry is cheap and frequently saves the whole run.
-          if [ "$BUILD_RC" -eq 137 ] || [ "$BUILD_RC" -eq 143 ]; then
-            echo "mka was terminated (exit code $BUILD_RC). Resource snapshot:"
-            free -h
-            df -h /
-            echo "Retrying once (incremental resume)..."
-            mka "$BUILD_TARGET" 2>&1 | tee /tmp/mka_retry.log
-            BUILD_RC=${PIPESTATUS[0]}
-          fi
-
-          if [ "$BUILD_RC" -ne 0 ]; then
-            echo "ERROR: mka $BUILD_TARGET failed (exit code $BUILD_RC). Last 120 lines:"
-            tail -n 120 /tmp/mka.log
-            if [ -f /tmp/mka_retry.log ]; then
-              echo "=== retry log tail ==="
-              tail -n 120 /tmp/mka_retry.log
+          attempt=1
+          max_attempt=5
+          while true; do
+            echo "=== BUILD ATTEMPT $attempt/$max_attempt (GOMEMLIMIT=$GOMEMLIMIT GOGC=$GOGC -j$BUILD_JOBS) ==="
+            m "-j$BUILD_JOBS" vendorbootimage 2>&1 | tee "$LOG"
+            rc=${PIPESTATUS[0]}
+            if [ "$rc" -eq 0 ]; then
+              echo "BUILD OK on attempt $attempt"
+              break
             fi
-            echo "=== memory ==="
-            free -h || true
-            echo "=== disk ==="
-            df -h / || true
-            echo "=== OOM killer evidence (if any) ==="
-            sudo dmesg -T 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' | tail -n 20 || echo "(no OOM records)"
-            exit 1
-          fi
-          echo "Build finished OK: $(date -u)"
 
-      - name: Collect build artifacts
+            elapsed=$(( ($(date +%s) - START) / 60 ))
+            echo "=== attempt $attempt FAILED (rc=$rc, ${elapsed}m elapsed) ==="
+            if [ "$rc" -eq 137 ] || [ "$rc" -eq 143 ]; then
+              echo "process was SIGKILLed/SIGTERMed (OOM or external kill)"
+            fi
+            tail -n 150 "$LOG" || true
+            echo "=== memory / disk / OOM evidence ==="
+            free -h || true
+            df -h / || true
+            ( dmesg 2>/dev/null || sudo dmesg ) \
+              | grep -iE "oom|out of memory|killed process" | tail -n 10 || true
+
+            if [ "$attempt" -ge "$max_attempt" ]; then
+              echo "::error::build failed after $max_attempt attempts"
+              exit 1
+            fi
+            if [ "$elapsed" -gt 300 ]; then
+              echo "::error::not enough time left for another retry (job timeout 360m). Re-run the workflow to continue incrementally."
+              exit 1
+            fi
+
+            # Auto-fix: if product-config/soong complains about a missing or
+            # unknown module, remove it from the device tree and retry. This
+            # heals base-vs-tree module skew (e.g. keymaster/health HALs).
+            MOD=$(grep -Eho 'unknown module "?[A-Za-z0-9._@/-]+"?|module "?[A-Za-z0-9._@/-]+"? does not exist|missing dependency: [A-Za-z0-9._@/-]+' "$LOG" \
+                  | head -n1 | sed -E 's/.*[ :"]([A-Za-z0-9._@/-]+)"?$/\1/' || true)
+            if [ -n "$MOD" ]; then
+              echo "auto-fix: dropping module '$MOD' from device makefiles"
+              grep -rl -- "$MOD" device/xiaomi/malachite/ 2>/dev/null \
+                | while read -r f; do sed -i "\%$MOD%d" "$f"; done
+            else
+              echo "no auto-fix pattern matched - retrying incrementally"
+            fi
+            attempt=$((attempt + 1))
+          done
+
+          echo "=== final build state ==="
+          free -h || true
+          df -h / || true
+
+      # ------------------------------------------------------------------
+      # Step 8 - collect + upload artifacts
+      # ------------------------------------------------------------------
+      - name: Collect artifacts
         run: |
           set -e
-          cd "$GITHUB_WORKSPACE/workspace/fox_16.0"
-          OUT="out/target/product/$DEVICE_CODENAME"
-          IMG="$OUT/vendor_boot.img"
-          if [ ! -f "$IMG" ]; then
-            echo "ERROR: vendor_boot.img was not produced. Contents of $OUT:"
-            ls -la "$OUT" 2>/dev/null || true
-            find out/target/product -maxdepth 2 -name '*.img' || true
+          cd "$SRC"
+          PROD="out/target/product/$DEVICE"
+          echo "=== product dir ==="
+          ls -la "$PROD" || true
+          mkdir -p "$GITHUB_WORKSPACE/foxout"
+          if [ -f "$PROD/vendor_boot.img" ]; then
+            cp "$PROD/vendor_boot.img" \
+              "$GITHUB_WORKSPACE/foxout/OrangeFox-Unofficial-malachite-vendor_boot.img"
+          else
+            echo "::error::vendor_boot.img was not produced"
             exit 1
           fi
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          cp "$IMG" "$GITHUB_WORKSPACE/artifacts/OrangeFox-Unofficial-$DEVICE_CODENAME.img"
-          cd "$GITHUB_WORKSPACE/artifacts"
-          zip -9 "OrangeFox-Unofficial-$DEVICE_CODENAME.zip" "OrangeFox-Unofficial-$DEVICE_CODENAME.img"
-          sha256sum * > sha256sums.txt
-          ls -la
-          {
-            echo "### OrangeFox Unofficial — $DEVICE_CODENAME"
-            echo '```'
-            cat sha256sums.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          find "$PROD" -maxdepth 1 -type f \( -iname '*orangefox*' -o -iname '*fox*.zip' \) \
+            -exec cp {} "$GITHUB_WORKSPACE/foxout/" \; || true
+          cd "$GITHUB_WORKSPACE/foxout"
+          sha256sum ./* | tee SHA256SUMS.txt
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: OrangeFox-Unofficial-malachite
-          path: artifacts/*
+          name: OrangeFox-unofficial-malachite
+          path: foxout/
           retention-days: 30
           if-no-files-found: error
+
+      - name: Print flash instructions
+        run: |
+          echo "=================================================================="
+          echo " Flashing (bootloader must be UNLOCKED):"
+          echo "   1. Download artifact: OrangeFox-unofficial-malachite"
+          echo "   2. adb reboot bootloader"
+          echo "   3. fastboot flash vendor_boot OrangeFox-Unofficial-malachite-vendor_boot.img"
+          echo "   4. fastboot reboot recovery   (or: fastboot reboot, then hold Vol+)"
+          echo ""
+          echo " Installing ROMs from OrangeFox:"
+          echo "   - Install ZIP : payload.bin (A/B OTA) zips install via the built-in A/B updater"
+          echo "   - ADB Sideload: Advanced > ADB Sideload, then: adb sideload <rom.zip>"
+          echo "=================================================================="
