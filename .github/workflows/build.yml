@@ -1,0 +1,157 @@
+# OrangeFox Recovery builder — Redmi Note 14 Pro 5G / POCO X7 (malachite)
+# Manifest : OrangeFox fox_16.0 (Android 16 Sync Build)
+# Target   : vendor_boot.img (recovery-in-vendor_boot, GKI)
+# Pola diadaptasi dari builder azwhikaru & chkndrp (Action-OFRP-Builder)
+# + perintah sync resmi dari README gitlab.com/OrangeFox/Manifest (fox_16.0)
+
+name: build-orangefox-malachite
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    if: github.event.repository.owner.id == github.event.sender.id
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+
+    - name: Check Out Device Tree (repo ini)
+      uses: actions/checkout@v4
+
+    - name: Cleanup Runner (beaskan ruang disk)
+      uses: rokibhasansagar/slimhub_actions@main
+
+    - name: Simpan Device Tree ke Folder Sementara
+      run: |
+        mkdir -p /home/runner/devtree
+        rsync -a --exclude ".git" --exclude ".github" ./ /home/runner/devtree/
+        echo "Isi device tree yang akan dipakai build:"
+        ls -la /home/runner/devtree/
+
+    - name: Initialize Workspace
+      id: pwd
+      run: |
+        mkdir workspace
+        cd workspace
+        echo "workspace-folder=$(pwd)" >> $GITHUB_OUTPUT
+
+    - name: Prepare Build Environment (OrangeFox scripts)
+      run: |
+        sudo apt-get install git aria2 -y
+        git clone --depth 1 https://gitlab.com/OrangeFox/misc/scripts
+        cd scripts
+        sudo bash setup/android_build_env.sh
+        sed -i 's/cd -/cd ../g' setup/install_android_sdk.sh
+        sudo bash setup/install_android_sdk.sh
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
+    - name: Sync OrangeFox Manifest fox_16.0
+      run: |
+        mkdir fox_16.0
+        cd fox_16.0
+        repo init --depth=1 -u https://gitlab.com/OrangeFox/Manifest.git -b fox_16.0
+        repo sync -c --no-clone-bundle --no-tags --fail-fast -j$(nproc --all)
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
+    - name: Pasang Device Tree & Hapus File Tidak Penting
+      run: |
+        cd ${{ steps.pwd.outputs.workspace-folder }}/fox_16.0
+        mkdir -p device/xiaomi/malachite
+        rsync -a --delete /home/runner/devtree/ device/xiaomi/malachite/
+        # === Hapus file GitHub yang tidak penting untuk build ===
+        rm -rf device/xiaomi/malachite/docs
+        rm -rf device/xiaomi/malachite/patches
+        rm -f  device/xiaomi/malachite/README.md
+        # Verifikasi file kritis wajib ada (anti build mental)
+        for f in AndroidProducts.mk BoardConfig.mk device.mk twrp_malachite.mk \
+                 fox_malachite.mk vendorsetup.sh prebuilt/dtb \
+                 recovery/root/system/etc/recovery.fstab \
+                 recovery/root/system/etc/twrp.flags; do
+          if [ ! -e "device/xiaomi/malachite/$f" ]; then
+            echo "::error::File kritis hilang: $f"; exit 1
+          fi
+        done
+        echo "=== device/xiaomi/malachite siap dibangun ==="
+        ls -la device/xiaomi/malachite/
+
+    - name: Set Swap Space (12 GB)
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 12
+
+    - name: Set up ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: fox-malachite-${{ github.sha }}
+        restore-keys: fox-malachite-
+
+    - name: Build OrangeFox (vendor_bootimage)
+      run: |
+        HOME_CCACHE_DIR=${{ steps.pwd.outputs.workspace-folder }}/../.ccache
+        BIND_CCACHE_DIR=/mnt/ccache
+
+        echo "Creating/Binding CCACHE directories ..."
+        if [ ! -d "$HOME_CCACHE_DIR" ]; then
+            mkdir -p $HOME_CCACHE_DIR
+        fi
+        sudo mkdir -p $BIND_CCACHE_DIR
+        sudo mount --bind $HOME_CCACHE_DIR $BIND_CCACHE_DIR
+
+        cd ${{ steps.pwd.outputs.workspace-folder }}/fox_16.0
+        set +e
+          export FOX_BUILD_DEVICE=malachite
+          source build/envsetup.sh
+        set -e
+        lunch twrp_malachite-bp2a-eng
+        make clean
+        mka adbd vendorbootimage -j$(nproc --all)
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
+    - name: Check Output Directory
+      run: |
+        ls -al ${{ steps.pwd.outputs.workspace-folder }}/fox_16.0/out/target/product/
+        echo
+        ls -al ${{ steps.pwd.outputs.workspace-folder }}/fox_16.0/out/target/product/malachite/
+
+    - name: Upload Artifact (IMG)
+      uses: actions/upload-artifact@v4
+      with:
+        name: OrangeFox-malachite-vendor_boot
+        path: |
+          workspace/fox_16.0/out/target/product/malachite/*.img
+          workspace/fox_16.0/out/target/product/malachite/*.zip
+        if-no-files-found: error
+        retention-days: 30
+
+    - name: Get Current Date
+      id: date
+      run: |
+        echo "builddate=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+    - name: Upload ke Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          workspace/fox_16.0/out/target/product/malachite/*.img
+          workspace/fox_16.0/out/target/product/malachite/*.zip
+        name: OrangeFox malachite ${{ github.run_number }}
+        tag_name: fox-malachite-${{ github.run_number }}
+        body: |
+          ## OrangeFox Recovery (UNOFFICIAL) — Redmi Note 14 Pro 5G / POCO X7 (malachite)
+          - **Manifest:** fox_16.0 (Android 16 Sync Build)
+          - **Device:** malachite (MT6878 / Dimensity 7300-Ultra)
+          - **Target:** vendor_boot.img
+          - **Build date:** ${{ steps.date.outputs.builddate }}
+          - **Maintainer:** dari fox_malachite.mk (OF_MAINTAINER)
+
+          ### Flash
+          ```
+          fastboot flash vendor_boot vendor_boot.img
+          fastboot reboot recovery
+          ```
+          Rekomendasi firmware: HyperOS **OS2.0.208.0.VOOMIXM** (Global).
+          **JANGAN flash dtbo/vbmeta dari firmware lain (risiko hard brick).**
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
