@@ -19,11 +19,19 @@ env:
   # Shown inside the recovery UI
   MAINTAINER: Unofficial Builder
 
+# Never run two builds at once: a new push/dispatch automatically replaces a
+# running build. (The replaced run ends with exit code 143 — that is the normal
+# cancellation signal, not a build error.)
+concurrency:
+  group: orangefox-malachite-build
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build OrangeFox Unofficial (malachite)
     runs-on: ubuntu-22.04
-    timeout-minutes: 350
+    # Hard cap for GitHub-hosted runners is 360 minutes per job.
+    timeout-minutes: 360
 
     steps:
       - name: Check out repository
@@ -49,14 +57,27 @@ jobs:
           git config --global user.name "OrangeFox Builder"
           git config --global user.email "builder@users.noreply.github.com"
 
-      - name: Sync OrangeFox source tree (fox_16.0)
+      - name: Sync OrangeFox source tree (fox_16.0, slimmed)
         run: |
           set -e
+          echo "Sync started: $(date -u)"
           mkdir -p workspace/fox_16.0
           cd workspace/fox_16.0
           repo init --depth=1 -u "$MANIFEST_URL" -b "$MANIFEST_BRANCH"
+          # The fox_16.0 default manifest pulls the FULL AOSP tree (~990 projects,
+          # tens of GB, hours to sync). OrangeFox ships remove-minimal.xml in the
+          # same manifest repo: an official list of ~600 AOSP projects that a
+          # recovery-only build never uses (other vendors' device trees,
+          # cuttlefish/emulator, x86 kernel prebuilts, Java/media/test packages).
+          # Verified: nothing the twrp_malachite build references is on the list
+          # (build/*, build/release, prebuilts/*, bionic, system/core,
+          # system/sepolicy, frameworks/base, frameworks/native,
+          # hardware/interfaces, bootable/recovery, vendor/* all remain).
+          # Applying it as a local manifest cuts the sync down to ~390 projects.
+          mkdir -p .repo/local_manifests
+          cp .repo/manifests/remove-minimal.xml .repo/local_manifests/
           repo sync -c -j8 --no-tags --fail-fast || repo sync -c -j4 --no-tags --fail-fast
-          echo "Sync finished. Disk usage:"
+          echo "Sync finished: $(date -u). Disk usage:"
           df -h /
 
       - name: Verify synced tree
@@ -167,6 +188,17 @@ jobs:
       - name: Build vendor_boot image
         run: |
           cd "$GITHUB_WORKSPACE/workspace/fox_16.0"
+          echo "Build step started: $(date -u)"
+          # If the runner ever terminates this step (SIGTERM -> exit code 143),
+          # record a resource snapshot so the cause (disk, memory, timeout)
+          # is visible in the log instead of a bare 143.
+          trap 'echo "=== Step received termination signal at $(date -u) ==="; df -h /; free -h; ps -eo pid,pcpu,pmem,rss,comm --sort=-rss | head -n 15' TERM INT
+          # Resource snapshot for the record: this is the phase where a previous
+          # run died with an unexplained exit code 143.
+          echo "=== Resources before build ==="
+          nproc
+          free -h
+          df -h /
           # Product name comes from the device tree's AndroidProducts.mk
           # (fox_16.0 convention keeps the TWRP-style name, e.g. twrp_malachite).
           PRODUCT=$(grep -m1 -oE '(twrp|fox|omni)_[A-Za-z0-9_]+' "$DEVICE_PATH/AndroidProducts.mk" | head -n1)
@@ -244,11 +276,35 @@ jobs:
 
           mka "$BUILD_TARGET" 2>&1 | tee /tmp/mka.log
           BUILD_RC=${PIPESTATUS[0]}
+
+          # Termination-class failures (143=SIGTERM, 137=SIGKILL) are often
+          # transient on hosted runners. Soong/kati resume incrementally, so a
+          # single retry is cheap and frequently saves the whole run.
+          if [ "$BUILD_RC" -eq 137 ] || [ "$BUILD_RC" -eq 143 ]; then
+            echo "mka was terminated (exit code $BUILD_RC). Resource snapshot:"
+            free -h
+            df -h /
+            echo "Retrying once (incremental resume)..."
+            mka "$BUILD_TARGET" 2>&1 | tee /tmp/mka_retry.log
+            BUILD_RC=${PIPESTATUS[0]}
+          fi
+
           if [ "$BUILD_RC" -ne 0 ]; then
             echo "ERROR: mka $BUILD_TARGET failed (exit code $BUILD_RC). Last 120 lines:"
             tail -n 120 /tmp/mka.log
+            if [ -f /tmp/mka_retry.log ]; then
+              echo "=== retry log tail ==="
+              tail -n 120 /tmp/mka_retry.log
+            fi
+            echo "=== memory ==="
+            free -h || true
+            echo "=== disk ==="
+            df -h / || true
+            echo "=== OOM killer evidence (if any) ==="
+            sudo dmesg -T 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' | tail -n 20 || echo "(no OOM records)"
             exit 1
           fi
+          echo "Build finished OK: $(date -u)"
 
       - name: Collect build artifacts
         run: |
