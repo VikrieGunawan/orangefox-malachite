@@ -1,0 +1,131 @@
+#
+# Copyright (C) 2025 The TWRP Open Source Project
+# Copyright (C) 2026 OrangeFox Recovery Project
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# OrangeFox (fox_16.0) device tree for Redmi Note 14 Pro 5G / POCO X7 (malachite)
+# Base: android_device_xiaomi_malachite_twrp (A16) by mytiantian001
+# OFRP conversion pattern: device_xiaomi_amethyst-recovery (fox_16.0) by chkndrp
+#
+
+DEVICE_PATH := device/xiaomi/malachite
+
+# Architecture
+TARGET_ARCH := arm64
+TARGET_ARCH_VARIANT := armv8-a
+TARGET_CPU_ABI := arm64-v8a
+TARGET_CPU_ABI2 :=
+TARGET_CPU_VARIANT := generic
+TARGET_CPU_VARIANT_RUNTIME := cortex-a55
+
+TARGET_2ND_ARCH := arm
+TARGET_2ND_ARCH_VARIANT := armv8-a
+TARGET_2ND_CPU_ABI := armeabi-v7a
+TARGET_2ND_CPU_ABI2 := armeabi
+TARGET_2ND_CPU_VARIANT := generic
+TARGET_2ND_CPU_VARIANT_RUNTIME := cortex-a55
+
+TARGET_IS_64_BIT := true
+TARGET_USES_64_BIT_BINDER := true
+TARGET_BOARD_SUFFIX := _64
+
+# Board info
+TARGET_BOARD_INFO_FILE := $(DEVICE_PATH)/board-info.txt
+
+# Power
+ENABLE_CPUSETS := true
+ENABLE_SCHEDBOOST := true
+
+# Assertion
+TARGET_OTA_ASSERT_DEVICE := malachite,malachite_global
+
+# Bootloader
+TARGET_BOOTLOADER_BOARD_NAME := mt6878
+TARGET_NO_BOOTLOADER := true
+TARGET_USES_UEFI := true
+
+# Build hacks
+BUILD_BROKEN_DUP_RULES := true
+BUILD_BROKEN_ELF_PREBUILT_PRODUCT_COPY_FILES := true
+BUILD_BROKEN_NINJA_USES_ENV_VARS += RTIC_MPGEN
+BUILD_BROKEN_USES_NETWORK := true
+BUILD_BROKEN_MISSING_REQUIRED_MODULES := true
+ALLOW_MISSING_DEPENDENCIES := true
+
+# Crypto: metadata partition (FBE keys live here)
+BOARD_USES_METADATA_PARTITION := true
+
+# Vendor Boot (GKI: kernel tetap di boot.img, recovery ramdisk + DTB ada di sini)
+TARGET_KERNEL_ARCH := arm64
+BOARD_RAMDISK_USE_LZ4 := true
+TARGET_KERNEL_HEADER_ARCH := arm64
+TARGET_NO_KERNEL := true
+BOARD_KERNEL_SEPARATED_DTBO := true
+TARGET_PREBUILT_DTB := $(DEVICE_PATH)/prebuilt/dtb
+BOARD_USES_GENERIC_KERNEL_IMAGE := true
+BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT := true
+BOARD_KERNEL_BASE := 0x3FFF8000
+BOARD_PAGE_SIZE := 4096
+BOARD_KERNEL_OFFSET := 0x00008000
+BOARD_RAMDISK_OFFSET := 0x26F08000
+BOARD_TAGS_OFFSET := 0x07C88000
+BOARD_BOOT_HEADER_VERSION := 4
+BOARD_DTB_SIZE := 444463
+BOARD_DTB_OFFSET := 0x07C88000
+BOARD_HEADER_SIZE := 2128
+BOARD_VENDOR_CMDLINE := "bootopt=64S3,32N2,64N2 androidboot.selinux=permissive"
+BOARD_MKBOOTIMG_ARGS += --dtb $(TARGET_PREBUILT_DTB)
+BOARD_MKBOOTIMG_ARGS += --vendor_cmdline $(BOARD_VENDOR_CMDLINE)
+BOARD_MKBOOTIMG_ARGS += --pagesize $(BOARD_PAGE_SIZE) --board ""
+BOARD_MKBOOTIMG_ARGS += --kernel_offset $(BOARD_KERNEL_OFFSET)
+BOARD_MKBOOTIMG_ARGS += --ramdisk_offset $(BOARD_RAMDISK_OFFSET)
+BOARD_MKBOOTIMG_ARGS += --tags_offset $(BOARD_TAGS_OFFSET)
+BOARD_MKBOOTIMG_ARGS += --header_version $(BOARD_BOOT_HEADER_VERSION)
+BOARD_MKBOOTIMG_ARGS += --dtb_offset $(BOARD_DTB_OFFSET)
+
+# Partitions
+BOARD_FLASH_BLOCK_SIZE := 262144
+BOARD_VENDOR_BOOTIMAGE_PARTITION_SIZE := 67108864
+BOARD_SUPER_PARTITION_SIZE := 9663676416
+BOARD_SUPER_PARTITION_GROUPS := main
+BOARD_MAIN_PARTITION_LIST := system system_ext product vendor vendor_dlkm odm
+BOARD_MAIN_SIZE := 9663676416 # (BOARD_SUPER_PARTITION_SIZE - 10485760) 10MiB
+BOARD_PARTITION_LIST := $(call to-upper, $(BOARD_MAIN_PARTITION_LIST))
+ $(foreach p, $(BOARD_PARTITION_LIST), $(eval BOARD_$(p)IMAGE_FILE_SYSTEM_TYPE := erofs))
+ $(foreach p, $(BOARD_PARTITION_LIST), $(eval TARGET_COPY_OUT_$(p) := $(call to-lower, $(p))))
+BOARD_USERDATAIMAGE_FILE_SYSTEM_TYPE := f2fs
+TARGET_USERIMAGES_USE_EXT4 := true
+TARGET_USERIMAGES_USE_F2FS := true
+BOARD_USES_VENDOR_DLKMIMAGE := true
+
+# Hardware
+BOARD_USES_MTK_HARDWARE := true
+
+# Platform (MediaTek Dimensity 7300-Ultra / MT6878)
+TARGET_BOARD_PLATFORM := mt6878
+
+# Properties
+TARGET_SYSTEM_PROP += $(DEVICE_PATH)/system.prop
+
+# Device Fstab
+TARGET_RECOVERY_FSTAB := $(DEVICE_PATH)/recovery/root/system/etc/recovery.fstab
+
+# Resolution
+TARGET_SCREEN_HEIGHT := 2712
+TARGET_SCREEN_WIDTH := 1220
+
+# Recovery
+TARGET_NO_RECOVERY := true
+BOARD_HAS_LARGE_FILESYSTEM := true
+BOARD_HAS_NO_SELECT_BUTTON := true
+BOARD_SUPPRESS_SECURE_ERASE := true
+TARGET_RECOVERY_PIXEL_FORMAT := RGBX_8888
+TARGET_USE_CUSTOM_LUN_FILE_PATH := /config/usb_gadget/g1/functions/mass_storage.usb0/lun.%d/file
+
+# Verified Boot
+BOARD_AVB_ENABLE := true
+
+# Init (libinit_malachite dari folder init/)
+TARGET_INIT_VENDOR_LIB := libinit_malachite
+TARGET_RECOVERY_DEVICE_MODULES := libinit_malachite
