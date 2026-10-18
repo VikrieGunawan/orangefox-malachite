@@ -78,9 +78,10 @@ jobs:
             FAIL=1
           fi
           if [ "$FAIL" -eq 1 ]; then exit 1; fi
-          # Informational only: a root-level vendorsetup.sh is a legacy AOSP artifact.
-          # fox_16.0 does NOT ship one and does NOT need it — product discovery is
-          # done through AndroidProducts.mk. Never fail the build over it.
+          # Informational only: a ROOT-level vendorsetup.sh is a legacy AOSP
+          # artifact that fox_16.0 never ships. Per-device vendorsetup.sh files
+          # (like the official reference tree's) are a different mechanism and
+          # ARE expected — never fail the build over the root one.
           if [ ! -f vendorsetup.sh ]; then
             echo "NOTE: root vendorsetup.sh is absent — normal for fox_16.0, continuing."
           fi
@@ -137,6 +138,22 @@ jobs:
           EOF
           echo "OrangeFox configuration appended:"
           tail -12 "$REPO_DIR/$DEVICE_PATH/BoardConfig.mk"
+          # Official fox_16.0 device trees ship a vendorsetup.sh that exports
+          # the device's FOX_* build variables (bash shell, nano editor, app
+          # manager, virtual A/B, ...). The manifest already syncs the official
+          # reference tree (device/xiaomi/mondrian), so derive malachite's copy
+          # from it — that keeps the pattern byte-identical to the proven
+          # reference. Only the device name needs replacing.
+          if [ -f "$REPO_DIR/device/xiaomi/mondrian/vendorsetup.sh" ]; then
+            sed 's/FDEVICE="mondrian"/FDEVICE="malachite"/' \
+              "$REPO_DIR/device/xiaomi/mondrian/vendorsetup.sh" \
+              > "$REPO_DIR/$DEVICE_PATH/vendorsetup.sh"
+            echo "Created $DEVICE_PATH/vendorsetup.sh (official OrangeFox pattern):"
+            tail -20 "$REPO_DIR/$DEVICE_PATH/vendorsetup.sh"
+          else
+            echo "WARNING: official reference vendorsetup.sh not found in the sync;"
+            echo "         continuing without FOX_* environment setup."
+          fi
 
       - name: Strip non-essential files from the device tree
         run: |
@@ -144,6 +161,7 @@ jobs:
           cd "$GITHUB_WORKSPACE/workspace/fox_16.0/$DEVICE_PATH"
           # Housekeeping before building: docs, metadata and the (already
           # applied) patch set are not needed by the build system.
+          # NOTE: vendorsetup.sh created earlier is intentionally KEPT.
           rm -rf .git .github README.md docs patches
           echo "Device tree after cleanup:"
           ls -la
@@ -159,24 +177,52 @@ jobs:
             exit 1
           fi
           echo "Building product: $PRODUCT"
+          # IMPORTANT: never source envsetup with errexit (`set -e`) active.
+          # GitHub Actions enables errexit by default. The OrangeFox envsetup
+          # scans and sources every synced device tree's vendorsetup.sh, and
+          # those scripts contain code paths that legitimately return a
+          # non-zero status (e.g. fox_get_target_device() in the official
+          # reference trees). Under errexit that kills the whole step — which
+          # is exactly the "including .../vendorsetup.sh" failure. Disable
+          # errexit here and validate each stage explicitly instead.
+          set +e
           source build/envsetup.sh
-          if lunch "$PRODUCT-eng"; then
-            echo "Lunched $PRODUCT-eng"
-          else
-            # Modern manifests require a release config segment
+          echo "envsetup sourced (exit code: $?)"
+
+          # Attempt 1: plain <product>-eng
+          lunch "$PRODUCT-eng" > /tmp/lunch1.log 2>&1
+          LUNCH_RC=$?
+          if [ "$LUNCH_RC" -ne 0 ]; then
+            echo "Direct lunch '$PRODUCT-eng' failed (exit code $LUNCH_RC). Log tail:"
+            tail -n 100 /tmp/lunch1.log
+            # Attempt 2: modern manifests often need a release config segment
             # (<product>-<release>-<variant>). Pick the first matching combo
             # offered by the lunch menu instead of hard-coding a release name.
-            lunch > /tmp/lunch_menu.log 2>&1 || true
+            lunch > /tmp/lunch_menu.log 2>&1
             CAND=$(grep -oE "$PRODUCT-[A-Za-z0-9_]+-eng" /tmp/lunch_menu.log | head -n1)
             if [ -z "$CAND" ]; then
               echo "ERROR: no usable lunch target found. Menu output:"
-              tail -60 /tmp/lunch_menu.log
+              tail -n 100 /tmp/lunch_menu.log
               exit 1
             fi
             echo "Lunching $CAND"
-            lunch "$CAND" || { echo "ERROR: lunch failed"; exit 1; }
+            lunch "$CAND" > /tmp/lunch2.log 2>&1
+            if [ $? -ne 0 ]; then
+              echo "ERROR: lunch $CAND failed. Log tail:"
+              tail -n 100 /tmp/lunch2.log
+              exit 1
+            fi
+          else
+            echo "Lunched $PRODUCT-eng"
           fi
-          mka "$BUILD_TARGET"
+
+          mka "$BUILD_TARGET" 2>&1 | tee /tmp/mka.log
+          BUILD_RC=${PIPESTATUS[0]}
+          if [ "$BUILD_RC" -ne 0 ]; then
+            echo "ERROR: mka $BUILD_TARGET failed (exit code $BUILD_RC). Last 120 lines:"
+            tail -n 120 /tmp/mka.log
+            exit 1
+          fi
 
       - name: Collect build artifacts
         run: |
