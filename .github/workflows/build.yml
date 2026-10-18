@@ -57,25 +57,81 @@ jobs:
           git config --global user.name "OrangeFox Builder"
           git config --global user.email "builder@users.noreply.github.com"
 
-      - name: Sync OrangeFox source tree (fox_16.0, slimmed)
+      - name: Sync OrangeFox source tree (fox_16.0)
         run: |
           set -e
           echo "Sync started: $(date -u)"
           mkdir -p workspace/fox_16.0
           cd workspace/fox_16.0
           repo init --depth=1 -u "$MANIFEST_URL" -b "$MANIFEST_BRANCH"
-          # The fox_16.0 default manifest pulls the FULL AOSP tree (~990 projects,
-          # tens of GB, hours to sync). OrangeFox ships remove-minimal.xml in the
-          # same manifest repo: an official list of ~600 AOSP projects that a
-          # recovery-only build never uses (other vendors' device trees,
-          # cuttlefish/emulator, x86 kernel prebuilts, Java/media/test packages).
-          # Verified: nothing the twrp_malachite build references is on the list
-          # (build/*, build/release, prebuilts/*, bionic, system/core,
-          # system/sepolicy, frameworks/base, frameworks/native,
-          # hardware/interfaces, bootable/recovery, vendor/* all remain).
-          # Applying it as a local manifest cuts the sync down to ~390 projects.
-          mkdir -p .repo/local_manifests
-          cp .repo/manifests/remove-minimal.xml .repo/local_manifests/
+          # -----------------------------------------------------------------
+          # IMPORTANT — fix for the previous run's failure:
+          # The fox_16.0 manifest chain (default.xml -> twrp-default.xml ->
+          # fox.xml + remove-minimal.xml) ALREADY applies OrangeFox's minimal
+          # project list by itself. A plain sync fetches ~405 projects, NOT
+          # the full ~990-project AOSP tree, and the sync is complete:
+          # bootable/recovery (OrangeFox fork), vendor/recovery, vendor/twrp,
+          # build/make, bionic, system/core, system/sepolicy,
+          # device/xiaomi/mondrian are all in the parsed manifest (verified).
+          # A previous version of this workflow copied remove-minimal.xml
+          # into .repo/local_manifests/ as an "extra" overlay. That overlay
+          # is now a FATAL DUPLICATE: repo re-runs all 602 <remove-project>
+          # entries against projects the chain itself already removed, and
+          # aborts the whole sync with:
+          #   remove-project element specifies non-existent project:
+          #   <remove-project path="bootable/deprecated-ota"/>
+          # (reproduced locally with repo v2.69). Therefore: do NOT add any
+          # remove-project overlay. Verify the manifest parses, then sync.
+          # -----------------------------------------------------------------
+          if repo manifest -o /tmp/combined_manifest.xml >/dev/null 2>/tmp/manifest_check.err; then
+            echo "Manifest parse: OK ($(grep -c '<project ' /tmp/combined_manifest.xml) projects after OrangeFox's own slimming)"
+          else
+            echo "WARNING: combined manifest does not parse. Upstream manifest hiccup?"
+            sed -n '1,5p' /tmp/manifest_check.err
+            echo "Attempting auto-fix for dangling <remove-project> entries..."
+            for ATTEMPT in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+              BAD=$(sed -n 's/.*non-existent project: \(<remove-project[^>]*\/>\).*/\1/p' /tmp/manifest_check.err | head -n1)
+              if [ -z "$BAD" ]; then
+                echo "No dangling remove-project identified; stopping auto-fix."
+                break
+              fi
+              echo "  stripping dangling entry: $BAD"
+              BAD="$BAD" python3 - <<'PYEOF'
+          import os, re, glob
+          bad = os.environ["BAD"]
+          m_path = re.search(r'path="([^"]*)"', bad)
+          m_name = re.search(r'name="([^"]*)"', bad)
+          key = (m_path.group(1) if m_path else None) or (m_name.group(1) if m_name else None)
+          if not key:
+              raise SystemExit(0)
+          for f in glob.glob(".repo/manifests/*.xml"):
+              try:
+                  with open(f, encoding="utf-8", errors="replace") as fh:
+                      lines = fh.readlines()
+              except OSError:
+                  continue
+              kept = [l for l in lines if not ("remove-project" in l and key in l)]
+              if len(kept) != len(lines):
+                  with open(f, "w", encoding="utf-8") as fh:
+                      fh.writelines(kept)
+                  print(f"    stripped from {f}")
+          PYEOF
+              if repo manifest -o /tmp/combined_manifest.xml >/dev/null 2>/tmp/manifest_check.err; then
+                echo "  manifest parses cleanly now."
+                break
+              fi
+            done
+            # Commit the edit so the manifests worktree stays clean when
+            # repo sync updates the manifests project (it rebases).
+            git -C .repo/manifests add -A >/dev/null 2>&1 || true
+            git -C .repo/manifests commit -qm "CI: strip dangling remove-project entries" >/dev/null 2>&1 || true
+            if ! repo manifest -o /tmp/combined_manifest.xml >/dev/null 2>/tmp/manifest_check.err; then
+              echo "ERROR: manifest still unparseable after auto-fix. Full error:"
+              cat /tmp/manifest_check.err
+              exit 1
+            fi
+            echo "Manifest parse: OK after auto-fix ($(grep -c '<project ' /tmp/combined_manifest.xml) projects)"
+          fi
           repo sync -c -j8 --no-tags --fail-fast || repo sync -c -j4 --no-tags --fail-fast
           echo "Sync finished: $(date -u). Disk usage:"
           df -h /
