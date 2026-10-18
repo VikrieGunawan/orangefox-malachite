@@ -1,0 +1,23 @@
+# OrangeFox malachite - protect binaries from git text filters
+* text=auto eol=lf
+
+prebuilt/dtb binary
+recovery/root/lib/modules/*.ko binary
+recovery/root/lib/modules/modules.alias -text
+recovery/root/lib/modules/modules.dep -text
+recovery/root/lib/modules/modules.load -text
+recovery/root/lib/modules/modules.load.recovery -text
+recovery/root/lib/modules/modules.softdep -text
+recovery/root/system/bin/* binary
+recovery/root/vendor/** binary
+recovery/root/vendor/bin/hw/* binary
+recovery/root/vendor/firmware/* binary
+recovery/root/vendor/mitee/** binary
+
+*.so binary
+*.bin binary
+*.img binary
+*.ko binary
+*.ta binary
+*.png binary
+*.jar binary
