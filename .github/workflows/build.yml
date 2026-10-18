@@ -78,10 +78,9 @@ jobs:
             FAIL=1
           fi
           if [ "$FAIL" -eq 1 ]; then exit 1; fi
-          # Informational only: a ROOT-level vendorsetup.sh is a legacy AOSP
-          # artifact that fox_16.0 never ships. Per-device vendorsetup.sh files
-          # (like the official reference tree's) are a different mechanism and
-          # ARE expected — never fail the build over the root one.
+          # Informational only: a root-level vendorsetup.sh is a legacy AOSP artifact.
+          # fox_16.0 does NOT ship one and does NOT need it — product discovery is
+          # done through AndroidProducts.mk. Never fail the build over it.
           if [ ! -f vendorsetup.sh ]; then
             echo "NOTE: root vendorsetup.sh is absent — normal for fox_16.0, continuing."
           fi
@@ -161,7 +160,6 @@ jobs:
           cd "$GITHUB_WORKSPACE/workspace/fox_16.0/$DEVICE_PATH"
           # Housekeeping before building: docs, metadata and the (already
           # applied) patch set are not needed by the build system.
-          # NOTE: vendorsetup.sh created earlier is intentionally KEPT.
           rm -rf .git .github README.md docs patches
           echo "Device tree after cleanup:"
           ls -la
@@ -177,43 +175,71 @@ jobs:
             exit 1
           fi
           echo "Building product: $PRODUCT"
+
           # IMPORTANT: never source envsetup with errexit (`set -e`) active.
           # GitHub Actions enables errexit by default. The OrangeFox envsetup
           # scans and sources every synced device tree's vendorsetup.sh, and
           # those scripts contain code paths that legitimately return a
-          # non-zero status (e.g. fox_get_target_device() in the official
-          # reference trees). Under errexit that kills the whole step — which
-          # is exactly the "including .../vendorsetup.sh" failure. Disable
-          # errexit here and validate each stage explicitly instead.
+          # non-zero status. Disable errexit here and validate each stage
+          # explicitly instead.
           set +e
           source build/envsetup.sh
           echo "envsetup sourced (exit code: $?)"
 
-          # Attempt 1: plain <product>-eng
-          lunch "$PRODUCT-eng" > /tmp/lunch1.log 2>&1
-          LUNCH_RC=$?
-          if [ "$LUNCH_RC" -ne 0 ]; then
-            echo "Direct lunch '$PRODUCT-eng' failed (exit code $LUNCH_RC). Log tail:"
-            tail -n 100 /tmp/lunch1.log
-            # Attempt 2: modern manifests often need a release config segment
-            # (<product>-<release>-<variant>). Pick the first matching combo
-            # offered by the lunch menu instead of hard-coding a release name.
-            lunch > /tmp/lunch_menu.log 2>&1
-            CAND=$(grep -oE "$PRODUCT-[A-Za-z0-9_]+-eng" /tmp/lunch_menu.log | head -n1)
-            if [ -z "$CAND" ]; then
-              echo "ERROR: no usable lunch target found. Menu output:"
-              tail -n 100 /tmp/lunch_menu.log
-              exit 1
+          # -------------------------------------------------------------------
+          # AOSP 16 lunch semantics (fox_16.0 is pinned to android-16.0.0_r1):
+          #   * lunch accepts EITHER the positional form
+          #       'lunch <product> <release> <variant>'
+          #     OR the legacy form 'lunch <product>-<release>-<variant>'
+          #     (exactly 3 dash-separated parts required).
+          #   * 2-part combos like 'twrp_malachite-eng' are REJECTED with
+          #     "Invalid lunch combo" — that is why previous builds died here.
+          #   * The interactive lunch menu was REMOVED ('lunch' with no args
+          #     only prints "No target specified"), so there is nothing to parse.
+          #   * add_lunch_combo is obsolete; COMMON_LUNCH_CHOICES in
+          #     AndroidProducts.mk is what the build system uses (the device
+          #     tree already ships it).
+          # Release configs shipped at android-16.0.0_r1
+          # (platform/build/release/release_configs/): ap2a ap3a ap4a bp1a bp2a,
+          # plus trunk_staging as the default development config.
+          # release_config_map.textproto does NOT gate releases per product,
+          # so every config above is valid for twrp_malachite.
+          # 'ap2a' is tried first because that is the release the device tree
+          # author's own build instructions were verified with.
+          # -------------------------------------------------------------------
+          echo "Release configs available in the synced tree:"
+          ls build/release/release_configs/ 2>/dev/null | sed 's/^/  /' || echo "  (not found, relying on candidate list)"
+
+          CANDIDATES="ap2a trunk_staging bp2a bp1a ap4a ap3a"
+          # Prefer dynamically discovered releases when the helper exists
+          # (build/soong/bin is added to PATH by sourcing envsetup).
+          if command -v list_releases >/dev/null 2>&1; then
+            DISCOVERED=$(list_releases "$PRODUCT" 2>/dev/null | tr '\n' ' ')
+            if [ -n "$DISCOVERED" ]; then
+              echo "list_releases $PRODUCT -> $DISCOVERED"
+              CANDIDATES="$DISCOVERED $CANDIDATES"
             fi
-            echo "Lunching $CAND"
-            lunch "$CAND" > /tmp/lunch2.log 2>&1
-            if [ $? -ne 0 ]; then
-              echo "ERROR: lunch $CAND failed. Log tail:"
-              tail -n 100 /tmp/lunch2.log
-              exit 1
+          fi
+
+          LUNCHED=0
+          for REL in $CANDIDATES; do
+            echo "Trying: lunch $PRODUCT-$REL-eng"
+            lunch "$PRODUCT-$REL-eng" > "/tmp/lunch_$REL.log" 2>&1
+            RC=$?
+            if [ "$RC" -eq 0 ]; then
+              echo "Lunch OK: $PRODUCT-$REL-eng"
+              echo "TARGET_PRODUCT=$TARGET_PRODUCT TARGET_RELEASE=$TARGET_RELEASE TARGET_BUILD_VARIANT=$TARGET_BUILD_VARIANT"
+              LUNCHED=1
+              break
+            else
+              echo "  failed (exit code $RC). Log tail:"
+              tail -n 15 "/tmp/lunch_$REL.log" | sed 's/^/    /'
             fi
-          else
-            echo "Lunched $PRODUCT-eng"
+          done
+
+          if [ "$LUNCHED" -ne 1 ]; then
+            echo "ERROR: no release config worked for $PRODUCT. Tried: $CANDIDATES"
+            exit 1
           fi
 
           mka "$BUILD_TARGET" 2>&1 | tee /tmp/mka.log
