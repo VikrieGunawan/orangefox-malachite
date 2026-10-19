@@ -74,21 +74,27 @@ jobs:
           #   "Text file busy" (ETXTBSY) — this exact error killed a run
           #   AFTER the 40-minute sync had completed. Doing it here means
           #   any runner-environment surprise costs 2 minutes, not 40+.
+          #
+          # Size = 16 GB, measured 2026-10-19: with 8 GB swap (23 GB total
+          # capacity) soong_build was OOM-killed TWICE in one run at
+          # anon-rss 14.7 GB. Peak demand ~17-20 GB, so the new capacity is
+          # 15 GB RAM + 16 GB swap = 31 GB. Disk cost is affordable: the
+          # synced tree + base image leave ~30 GB free with swap in place.
           # ---------------------------------------------------------------
           if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile'; then
             echo "Existing /swapfile is active — switching it off before resizing."
             sudo swapoff /swapfile 2>/dev/null || sudo swapoff -a || true
           fi
           sudo rm -f /swapfile
-          if ! sudo fallocate -l 8G /swapfile 2>/tmp/fallocate.err; then
+          if ! sudo fallocate -l 16G /swapfile 2>/tmp/fallocate.err; then
             echo "fallocate failed ($(cat /tmp/fallocate.err)) — falling back to dd."
             sudo rm -f /swapfile
-            sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=none
+            sudo dd if=/dev/zero of=/swapfile bs=1M count=16384 status=none
           fi
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
-          echo "Memory after adding 8 GB swap:"
+          echo "Memory after adding 16 GB swap:"
           free -h
           swapon --show
 
@@ -489,12 +495,16 @@ jobs:
           free -h
           df -h /
           # -------------------------------------------------------------------
-          # OOM guard for soong_build (a Go binary). A previous run reached
-          # ~14.4 GB RSS and was killed on the ~15 GB runner. GOMEMLIMIT is
-          # Go's soft heap limit: the GC now compacts well before that point,
-          # and the 8 GB swap (set up before the sync) is the safety net.
+          # OOM guard for soong_build (a Go binary). MEASURED on 2026-10-19:
+          # soong_build was OOM-killed twice in one run at anon-rss 14.7 GB
+          # even WITH 8 GB swap (15 GB RAM + 8 GB swap = 23 GB total). The
+          # live Go heap of this tree is genuinely >12 GB — GOMEMLIMIT is a
+          # soft ceiling (the GC compacts near it) but can never reduce the
+          # live set. 14 GiB keeps GC from thrashing while the enlarged
+          # 16 GB swap (31 GB total capacity, set up before the sync) is
+          # what actually prevents the kill.
           # -------------------------------------------------------------------
-          export GOMEMLIMIT=12GiB
+          export GOMEMLIMIT=14GiB
           # Product name comes from the device tree's AndroidProducts.mk
           # (fox_16.0 convention keeps the TWRP-style name, e.g. twrp_malachite).
           PRODUCT=$(grep -m1 -oE '(twrp|fox|omni)_[A-Za-z0-9_]+' "$DEVICE_PATH/AndroidProducts.mk" | head -n1)
@@ -573,17 +583,30 @@ jobs:
           mka "$BUILD_TARGET" 2>&1 | tee /tmp/mka.log
           BUILD_RC=${PIPESTATUS[0]}
 
-          # Termination-class failures (143=SIGTERM, 137=SIGKILL) are often
-          # transient on hosted runners. Soong/kati resume incrementally, so a
-          # single retry is cheap and frequently saves the whole run.
+          # Termination-class failures (143=SIGTERM, 137=SIGKILL): check WHY
+          # before retrying. If the kernel OOM-killed soong/kati, a retry in
+          # the SAME run hits the identical memory wall — measured 2026-10-19:
+          # the blind retry was OOM-killed too and only burned ~20 minutes of
+          # swap thrash. Retry ONLY when there is NO OOM evidence (a genuine
+          # runner transient). Soong/kati resume incrementally, so non-OOM
+          # retries are cheap and frequently save the whole run.
+          OOM_DETECTED=0
+          if sudo dmesg -T 2>/dev/null | grep -qiE 'killed process.*\((soong_build|soong_ui|ckati|ninja)\)'; then
+            OOM_DETECTED=1
+          fi
           if [ "$BUILD_RC" -eq 137 ] || [ "$BUILD_RC" -eq 143 ]; then
-            echo "mka was terminated (exit code $BUILD_RC). Resource snapshot:"
-            free -h
-            df -h /
-            swapon --show || true
-            echo "Retrying once (incremental resume)..."
-            mka "$BUILD_TARGET" 2>&1 | tee /tmp/mka_retry.log
-            BUILD_RC=${PIPESTATUS[0]}
+            if [ "$OOM_DETECTED" -eq 1 ]; then
+              echo "mka was killed (exit code $BUILD_RC) AND the kernel log shows an OOM kill."
+              echo "NOT retrying: within the same run the memory wall is identical."
+            else
+              echo "mka was terminated (exit code $BUILD_RC, no OOM evidence). Resource snapshot:"
+              free -h
+              df -h /
+              swapon --show || true
+              echo "Retrying once (incremental resume)..."
+              mka "$BUILD_TARGET" 2>&1 | tee /tmp/mka_retry.log
+              BUILD_RC=${PIPESTATUS[0]}
+            fi
           fi
 
           if [ "$BUILD_RC" -ne 0 ]; then
@@ -600,6 +623,10 @@ jobs:
             df -h / || true
             echo "=== OOM killer evidence (if any) ==="
             sudo dmesg -T 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' | tail -n 20 || echo "(no OOM records)"
+            if [ "$OOM_DETECTED" -eq 1 ]; then
+              echo ">>> CONFIRMED root cause: the kernel OOM-killed the build (see evidence above)."
+              echo ">>> The runner's total memory (RAM + swap) is smaller than soong's measured demand."
+            fi
             exit 1
           fi
           echo "Build finished OK: $(date -u)"
