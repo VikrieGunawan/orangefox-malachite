@@ -105,9 +105,9 @@ jobs:
           # ubuntu-24.04 package fallbacks: libncurses5 and libgl1-mesa-dev may
           # not exist on newer images — try the classic name, fall back silently.
           sudo apt-get install -y -qq git zip curl build-essential libgl1-mesa-dev \
-            libxml2-utils xsltproc unzip rsync >/dev/null || \
+            libxml2-utils xsltproc unzip rsync m4 >/dev/null || \
             sudo apt-get install -y -qq git zip curl build-essential libgl-dev \
-            libxml2-utils xsltproc unzip rsync >/dev/null
+            libxml2-utils xsltproc unzip rsync m4 >/dev/null
           sudo apt-get install -y -qq libncurses5 >/dev/null 2>&1 || \
             sudo apt-get install -y -qq libncurses6 >/dev/null
           sudo curl -s https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
@@ -593,6 +593,92 @@ jobs:
             echo "WARNING: official reference vendorsetup.sh not found in the sync;"
             echo "         continuing without FOX_* environment setup."
           fi
+
+      # -------------------------------------------------------------------
+      # T15 root cause (measured 2026-10-19, ninja died at 45%, 56 min):
+      #   system/sepolicy/vendor/hal_hwcrypto_default.te:2:
+      #   ERROR 'attribute hal_hwcrypto_server is not declared'
+      # fox_16.0 = android-16.0.0_r1. In that tree the platform vendor
+      # policy unconditionally references symbols that PUBLIC policy only
+      # declares inside starting_at_board_api(202504, ...) conditionals:
+      #   vendor/hal_hwcrypto_default.te        -> hal_hwcrypto{,_client,_server}
+      #   vendor/hal_mediaquality_default.te    -> hal_mediaquality{,_client,_server}
+      #   vendor/hal_vm_capabilities_default.te -> hal_vm_capabilities{,_client,_server}
+      #   vendor/tee.te                         -> attribute tee_service_type
+      # The conditionals expand only when target_board_api_level >= 202504.
+      # system/sepolicy/build/soong/selinux.go injects
+      #   -D target_board_api_level=$(VendorApiLevel)
+      # and VendorApiLevel() derives from BOARD_API_LEVEL - which TWRP
+      # device trees (incl. malachite) never set. Google builds this exact
+      # tag with BOARD_API_LEVEL=202504 (Pixel boards), so the vendor file
+      # is INTENDED to compile with the 202504 blocks active.
+      # Fix: pin the m4 variable to 202504 inside flagging/flagging_macros.
+      # In m4 a later define() overrides the -D command-line define, and
+      # flagging_macros reaches every se_policy_conf through the
+      # se_policy_conf_flags_defaults defaults (vendor_sepolicy.conf lists
+      # it), before any use of the macros. This pins ONLY the sepolicy
+      # flagging semantics - exporting BOARD_API_LEVEL instead would shift
+      # unrelated parts of the build (VINTF, sysprops, apex).
+      # -------------------------------------------------------------------
+      - name: Pin sepolicy board-API flagging to 202504 (fox_16.0)
+        run: |
+          set -e
+          REPO_DIR="$GITHUB_WORKSPACE/workspace/fox_16.0"
+          MACROS="$REPO_DIR/system/sepolicy/flagging/flagging_macros"
+          if [ ! -f "$MACROS" ]; then
+            echo "FAIL-FAST: $MACROS not found (unexpected tree layout)"
+            exit 1
+          fi
+          # Shape check: this fix relies on the exact upstream macro pair.
+          if ! grep -q 'define(`starting_at_board_api' "$MACROS" || \
+             ! grep -q 'target_board_api_level' "$MACROS"; then
+            echo "FAIL-FAST: unexpected flagging_macros content:"
+            cat "$MACROS"
+            exit 1
+          fi
+          if grep -qF 'FOX-MALACHITE-CI: target_board_api_level pinned' "$MACROS"; then
+            echo "flagging_macros already pinned (idempotent rerun)"
+          else
+            cat >> "$MACROS" <<'EOF'
+
+          # ==== FOX-MALACHITE-CI: target_board_api_level pinned to 202504 ====
+          # fox_16.0 = android-16.0.0_r1: system/sepolicy/vendor/*.te reference
+          # hal_hwcrypto / hal_mediaquality / hal_vm_capabilities /
+          # tee_service_type, which public policy declares only inside
+          # starting_at_board_api(202504, ...). Google builds this tag with
+          # BOARD_API_LEVEL=202504; TWRP device trees do not set BOARD_API_LEVEL,
+          # so system/sepolicy/build/soong/selinux.go injects a lower
+          # -D target_board_api_level and checkpolicy fails with
+          # "attribute hal_hwcrypto_server is not declared".
+          # In m4 a later define() overrides the -D command-line define.
+          define(`target_board_api_level', `202504')
+          EOF
+          fi
+          echo "Pinned flagging_macros (tail):"
+          tail -n 13 "$MACROS"
+          # -----------------------------------------------------------------
+          # Behavioral self-test: reproduce soong's m4 invocation shape
+          # (-D target_board_api_level=<low>) and verify that after the pin
+          # starting_at_board_api(202504, ...) expands while
+          # until_board_api(202504, ...) stays suppressed.
+          # -----------------------------------------------------------------
+          TESTDIR="$(mktemp -d)"
+          cp "$MACROS" "$TESTDIR/flagging_macros"
+          cat > "$TESTDIR/use.te" <<'USEEOF'
+          starting_at_board_api(202504, `PIN_202504_EXPANDED_OK')
+          until_board_api(202504, `WRONG_UNTIL_202504_EXPANDED')
+          USEEOF
+          OUT="$(m4 -D target_board_api_level=34 "$TESTDIR/flagging_macros" "$TESTDIR/use.te")"
+          echo "m4 self-test output: $OUT"
+          if echo "$OUT" | grep -q PIN_202504_EXPANDED_OK && \
+             ! echo "$OUT" | grep -q WRONG_UNTIL_202504_EXPANDED; then
+            echo "m4 self-test PASSED: 202504 blocks expand, pre-202504 blocks suppressed"
+          else
+            echo "FAIL-FAST: flagging pin did not behave as expected. Output:"
+            echo "$OUT"
+            exit 1
+          fi
+          rm -rf "$TESTDIR"
 
       - name: Strip non-essential files from the device tree
         run: |
