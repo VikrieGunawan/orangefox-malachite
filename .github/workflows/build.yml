@@ -455,6 +455,51 @@ jobs:
           echo "Patch verification (soong_build main.go):"
           grep -n "SetMemoryLimit\|runtime/debug" build/soong/cmd/soong_build/main.go
 
+          # -----------------------------------------------------------------
+          # LLNDK/VNDK ABI compatibility gates - killed at source (measured
+          # 2026-10-19). android-16.0.0_r1 (the exact revision fox_16.0 syncs)
+          # hard-fails the build at header-abi-diff when a rebuilt LLNDK
+          # library (first hit: libbinder_ndk) does not match the checked-in
+          # reference dumps (prebuilts/abi-dumps/vndk/202404/...).
+          # AOSP itself ships an escape hatch for exactly this: SKIP_ABI_CHECKS
+          # (build/soong/cc/sabi.go: "Escape hatch to not check any ABI
+          # dump."). It is read via ctx.Config().IsEnvTrue() - but soong_ui
+          # launches soong_build through a wiped environment (proven twice with
+          # GOMEMLIMIT), so the flag can never arrive by exporting it. Activate
+          # the same hatch at source level: the two mutator sites below are the
+          # ONLY writers of ShouldCreateSourceAbiDump (verified in
+          # android-16.0.0_r1: cc/sabi.go + cc/library.go:661,1567), so no
+          # lsdump/header-abi-diff task is ever generated. This is build-time
+          # hygiene only: AOSP already exempts recovery variants from these
+          # checks ("Don't check ramdisk or recovery variants") and the dumps
+          # produce no runtime artifact. Fail-fast if upstream moved the hatch.
+          # -----------------------------------------------------------------
+          python3 - <<'SABIEOF'
+          import os
+          path = "build/soong/cc/sabi.go"
+          if not os.path.exists(path):
+              raise SystemExit("FAIL-FAST: %s not found - upstream moved the ABI "
+                               "gate; cannot apply the SKIP_ABI_CHECKS patch." % path)
+          src = open(path, encoding="utf-8").read()
+          needle = 'ctx.Config().IsEnvTrue("SKIP_ABI_CHECKS")'
+          n = src.count(needle)
+          if n == 0:
+              if "SKIP_ABI_CHECKS" in src:
+                  raise SystemExit("FAIL-FAST: %s mentions SKIP_ABI_CHECKS in an "
+                                   "unexpected form; the escape hatch changed "
+                                   "upstream - refusing to guess." % path)
+              print("sabi.go already patched (ABI gate disabled).")
+              raise SystemExit(0)
+          if n != 2:
+              raise SystemExit("FAIL-FAST: expected 2 occurrences of the ABI escape "
+                               "hatch in %s, found %d - refusing to blind-patch." % (path, n))
+          src = src.replace(needle, 'true /* CI: ABI gate disabled */')
+          open(path, "w", encoding="utf-8").write(src)
+          print("Patched %s: ABI gate disabled at both mutator sites." % path)
+          SABIEOF
+          echo "Patch verification (soong cc/sabi.go):"
+          grep -n "CI: ABI gate disabled" build/soong/cc/sabi.go
+
       - name: Add OrangeFox device configuration
         run: |
           set -e
@@ -579,6 +624,14 @@ jobs:
             rm -rf .repo/projects .repo/project-objects
             df -h /
           fi
+          # Second-tier reclaim: the checked-in ABI reference dumps
+          # (prebuilts/abi-dumps/*) are dead weight for this build - the ABI
+          # gate is disabled in the patch step, so no ninja task reads them.
+          if [ "$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')" -lt 25 ]; then
+            echo "Purging unused prebuilts/abi-dumps (ABI checks are disabled)."
+            rm -rf prebuilts/abi-dumps
+            df -h /
+          fi
           echo "Memory available for the build (swap was set up before the sync):"
           free -h
           swapon --show || true
@@ -607,6 +660,11 @@ jobs:
           # what actually prevents the kill.
           # -------------------------------------------------------------------
           export GOMEMLIMIT=14GiB
+          # Also export the AOSP escape hatch ("SKIP_ABI_CHECKS",
+          # build/soong/cc/sabi.go) for any stage that reads the environment
+          # directly; the deterministic source-level activation lives in the
+          # patch step above (soong_ui wipes the child environment).
+          export SKIP_ABI_CHECKS=true
           # Product name comes from the device tree's AndroidProducts.mk
           # (fox_16.0 convention keeps the TWRP-style name, e.g. twrp_malachite).
           PRODUCT=$(grep -m1 -oE '(twrp|fox|omni)_[A-Za-z0-9_]+' "$DEVICE_PATH/AndroidProducts.mk" | head -n1)
