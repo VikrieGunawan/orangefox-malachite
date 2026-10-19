@@ -430,6 +430,33 @@ jobs:
           EOF
           echo "OrangeFox configuration appended:"
           tail -12 "$REPO_DIR/$DEVICE_PATH/BoardConfig.mk"
+          # -----------------------------------------------------------------
+          # Fix for the Android 16 soong analysis error (measured 2026-10-19):
+          #   module "prebuilt_com.android.crashrecovery-systemserverclasspath-fragment":
+          #   [service-crashrecovery] in contents must also be declared in
+          #   PRODUCT_APEX_SYSTEM_SERVER_JARS
+          # CrashRecovery became a Mainline module in A16 and ships a NEW
+          # system-server classpath fragment that TWRP-style product configs
+          # do not declare yet. The proven community fix (A16 TWRP trees,
+          # e.g. device_xiaomi_onyx-TWRP) is exactly one line; the
+          # "apexname:jarname" format is documented at source.android.com
+          # (Configure ART). It is appended to the LEAF product file
+          # (twrp_malachite.mk) so nothing inherited afterwards overrides it.
+          # NOTE: PRODUCT_* variables belong in a product .mk, never in
+          # BoardConfig.mk (which is for BOARD_* variables).
+          # -----------------------------------------------------------------
+          if [ -f "$REPO_DIR/$DEVICE_PATH/twrp_malachite.mk" ]; then
+            PRODUCT_MK="$REPO_DIR/$DEVICE_PATH/twrp_malachite.mk"
+          else
+            PRODUCT_MK="$REPO_DIR/$DEVICE_PATH/device.mk"
+          fi
+          cat >> "$PRODUCT_MK" <<EOF
+
+          # Fix for the A16 CrashRecovery soong error (added by CI)
+          PRODUCT_APEX_SYSTEM_SERVER_JARS += com.android.crashrecovery:service-crashrecovery
+          EOF
+          echo "CrashRecovery PRODUCT_APEX_SYSTEM_SERVER_JARS fix appended to $PRODUCT_MK:"
+          tail -4 "$PRODUCT_MK"
           # Official fox_16.0 device trees ship a vendorsetup.sh that exports
           # the device's FOX_* build variables (bash shell, nano editor, app
           # manager, virtual A/B, ...). The manifest already syncs the official
@@ -462,7 +489,7 @@ jobs:
       # databases (.repo/projects + .repo/project-objects). The checked-out
       # working trees are KEPT — the compiler only reads source files, never
       # git metadata, and the device tree/patches are applied before this
-      # step. The 8 GB swap was already set up BEFORE the sync (first step),
+      # step. The 16 GB swap was already set up BEFORE the sync (first step),
       # so nothing memory-related can fail here anymore.
       # -------------------------------------------------------------------
       - name: Reclaim disk space (pre-build)
