@@ -459,6 +459,30 @@ jobs:
         run: |
           set -e
           REPO_DIR="$GITHUB_WORKSPACE/workspace/fox_16.0"
+          # -----------------------------------------------------------------
+          # fox_16.0 HARD-FAILS on the renamed (obsolete) OrangeFox variables
+          # (bootable/recovery/orangefox.mk: '"OF_AB_DEVICE" is obsolete. Use
+          # "export FOX_AB_DEVICE=1" instead.' - measured 2026-10-19).
+          # Rewrite any stale names in the device tree to their fox_16.0
+          # spellings before anything reads them. The \b word boundaries keep
+          # the still-valid OF_AB_DEVICE_WITH_RECOVERY_PARTITION untouched.
+          # -----------------------------------------------------------------
+          sed -i \
+            -e 's/\bOF_VIRTUAL_AB_DEVICE\b/FOX_VIRTUAL_AB_DEVICE/g' \
+            -e 's/\bOF_AB_DEVICE\b/FOX_AB_DEVICE/g' \
+            -e 's/\bOF_PATCH_VBMETA_FLAG\b/FOX_PATCH_VBMETA_FLAG/g' \
+            -e 's/\bOF_VANILLA_BUILD\b/FOX_VANILLA_BUILD/g' \
+            -e 's/\bOF_TARGET_DEVICES\b/FOX_TARGET_DEVICES/g' \
+            -e 's/\bFOX_USE_LZMA_COMPRESSION\b/OF_USE_LZMA_COMPRESSION/g' \
+            -e 's/\bFOX_ADVANCED_SECURITY\b/OF_ADVANCED_SECURITY/g' \
+            -e 's/\bFOX_USE_LZ4_COMPRESSION\b/OF_USE_LZ4_COMPRESSION/g' \
+            "$REPO_DIR/$DEVICE_PATH/"*.mk
+          # Sanity net: after the rewrite, no renamed variable may remain.
+          if grep -HEq '\b(OF_VIRTUAL_AB_DEVICE|OF_AB_DEVICE|OF_PATCH_VBMETA_FLAG|OF_VANILLA_BUILD|OF_TARGET_DEVICES|FOX_USE_LZMA_COMPRESSION|FOX_ADVANCED_SECURITY|FOX_USE_LZ4_COMPRESSION)\b[[:space:]]*[:+?]?=' "$REPO_DIR/$DEVICE_PATH/"*.mk; then
+            echo "FAIL-FAST: obsolete OrangeFox variables remain after rewrite:"
+            grep -HnE '\b(OF_VIRTUAL_AB_DEVICE|OF_AB_DEVICE|OF_PATCH_VBMETA_FLAG|OF_VANILLA_BUILD|OF_TARGET_DEVICES|FOX_USE_LZMA_COMPRESSION|FOX_ADVANCED_SECURITY|FOX_USE_LZ4_COMPRESSION)\b[[:space:]]*[:+?]?=' "$REPO_DIR/$DEVICE_PATH/"*.mk
+            exit 1
+          fi
           # Pattern taken from the official OrangeFox fox_16.0 reference tree
           # (device/xiaomi/mondrian), adapted for an A/B vendor_boot-only device:
           # no OF_AB_DEVICE_WITH_RECOVERY_PARTITION here, because malachite has
@@ -466,7 +490,12 @@ jobs:
           cat >> "$REPO_DIR/$DEVICE_PATH/BoardConfig.mk" <<EOF
 
           # ---- OrangeFox Recovery (fox_16.0) ----
-          OF_AB_DEVICE := 1
+          # fox_16.0 renamed OF_AB_DEVICE to FOX_AB_DEVICE (the old spelling is
+          # a hard kati error). FOX_AB_DEVICE is also auto-set by orangefox.mk
+          # because device.mk sets AB_OTA_UPDATER := true, and it is exported by
+          # the derived vendorsetup.sh below; the explicit assignment keeps the
+          # configuration self-sufficient even if those two paths change.
+          FOX_AB_DEVICE := 1
           OF_SCREEN_H := 2712
           OF_STATUS_INDENT_LEFT := 48
           OF_STATUS_INDENT_RIGHT := 48
@@ -475,7 +504,7 @@ jobs:
           OF_MAINTAINER := "$MAINTAINER"
           EOF
           echo "OrangeFox configuration appended:"
-          tail -12 "$REPO_DIR/$DEVICE_PATH/BoardConfig.mk"
+          tail -18 "$REPO_DIR/$DEVICE_PATH/BoardConfig.mk"
           # -----------------------------------------------------------------
           # Fix for the Android 16 soong analysis error (measured 2026-10-19):
           #   module "prebuilt_com.android.crashrecovery-systemserverclasspath-fragment":
