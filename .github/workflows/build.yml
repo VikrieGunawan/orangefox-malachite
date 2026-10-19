@@ -409,6 +409,52 @@ jobs:
             echo "WARNING: patch does not apply cleanly (likely already fixed upstream). Continuing."
           fi
 
+          # -----------------------------------------------------------------
+          # CRITICAL memory patch for soong_build (measured 2026-10-19):
+          #   soong_ui launches soong_build via `env -i` — a WIPED
+          #   environment. Exported GOMEMLIMIT/GOGC NEVER reach the child
+          #   process (proven twice: OOM-killed with an unbounded Go heap,
+          #   total-vm growing 24 GB -> 31 GB and 15.5 GB of swap fully
+          #   consumed while GOMEMLIMIT was exported in the shell).
+          #   Instead of relying on the environment, patch the soong_build
+          #   entry point to call Go's runtime/debug.SetMemoryLimit()
+          #   directly — semantically identical to GOMEMLIMIT but impossible
+          #   to strip via env -i. 14 GiB keeps the GC compacting well
+          #   before the 31 GB capacity (15 GB RAM + 16 GB swap) is reached.
+          #   Fail-fast if upstream moved the file/anchors: silently
+          #   skipping would burn a 40-minute sync on another OOM.
+          # -----------------------------------------------------------------
+          cd "$REPO_DIR"
+          python3 - <<'SOONGEOF'
+          import os, re
+          path = "build/soong/cmd/soong_build/main.go"
+          if not os.path.exists(path):
+              raise SystemExit("FAIL-FAST: %s not found - soong entry point moved "
+                               "upstream; cannot apply the memory-limit patch." % path)
+          src = open(path, encoding="utf-8").read()
+          if "debug.SetMemoryLimit" in src:
+              print("soong_build main.go already patched (debug.SetMemoryLimit present).")
+              raise SystemExit(0)
+          # 1) make sure the runtime/debug import exists
+          if '"runtime/debug"' not in src:
+              m = re.search(r'import \(\n', src)
+              if not m:
+                  raise SystemExit("FAIL-FAST: no 'import (' block found in %s" % path)
+              src = src[:m.end()] + '\t"runtime/debug"\n' + src[m.end():]
+          # 2) inject the limit as the first statement of main()
+          m = re.search(r'func main\(\) \{\n', src)
+          if not m:
+              raise SystemExit("FAIL-FAST: no 'func main() {' anchor found in %s" % path)
+          injection = ('\t// CI: hard Go heap limit - soong_ui launches this binary via '
+                       '"env -i" which strips GOMEMLIMIT, see workflow.\n'
+                       '\tdebug.SetMemoryLimit(14 << 30)\n\n')
+          src = src[:m.end()] + injection + src[m.end():]
+          open(path, "w", encoding="utf-8").write(src)
+          print("Patched %s -> debug.SetMemoryLimit(14 << 30)" % path)
+          SOONGEOF
+          echo "Patch verification (soong_build main.go):"
+          grep -n "SetMemoryLimit\|runtime/debug" build/soong/cmd/soong_build/main.go
+
       - name: Add OrangeFox device configuration
         run: |
           set -e
