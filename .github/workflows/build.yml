@@ -16,8 +16,10 @@ env:
   DEVICE_CODENAME: malachite
   # Recovery lives in vendor_boot on this device (A/B, no dedicated recovery partition)
   BUILD_TARGET: vendorbootimage
-  # Shown inside the recovery UI
-  MAINTAINER: Unofficial Builder
+  # Shown inside the recovery UI (About page). Keep this value UNQUOTED:
+  # the OrangeFox build glue adds the C-level quotes itself when it emits
+  # the -D flags, so literal quotes here would end up doubled in C++.
+  MAINTAINER: VikrieGunawan
 
 # Never run two builds at once: a new push/dispatch automatically replaces a
 # running build. (The replaced run ends with exit code 143 — that is the normal
@@ -546,7 +548,11 @@ jobs:
           OF_STATUS_INDENT_RIGHT := 48
           OF_CLOCK_POS := 1
           OF_ADVANCED_SECURITY := 1
-          OF_MAINTAINER := "$MAINTAINER"
+          # String values must stay UNQUOTED: the OrangeFox build glue wraps
+          # each value in C quotes when emitting -D flags. A quoted value
+          # here produced ""..."" and failed C++11 compilation with
+          # "invalid suffix on literal" (orscmd.cpp, measured 2026-10-20).
+          OF_MAINTAINER := $MAINTAINER
           EOF
           echo "OrangeFox configuration appended:"
           tail -18 "$REPO_DIR/$DEVICE_PATH/BoardConfig.mk"
