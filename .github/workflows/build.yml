@@ -150,6 +150,135 @@ jobs:
             fi
             echo "Manifest parse: OK after auto-fix ($(grep -c '<project ' /tmp/combined_manifest.xml) projects)"
           fi
+          # -----------------------------------------------------------------
+          # Pre-flight repair for fox_16.0 work-in-progress pins.
+          #
+          # Verified 2026-10-19: the fox_16.0 manifest pins several BRAND NEW
+          # OrangeFox-fork repos that are not publicly fetchable yet:
+          #   external/libarchive  -> HTTP 401 (private/not published)
+          #   external/libfuse3    -> HTTP 401 (private/not published)
+          #   external/fox-go      -> HTTP 404 (does not exist publicly)
+          #   external/rclone      -> public, but its genrule uses
+          #                           tools: ["fox_go"] from the missing fox-go
+          # repo sync then aborts deterministically with
+          #   "Unable to remote fetch project external/libarchive".
+          # Substituting/removing them is SAFE: a full audit of
+          # bootable/recovery (62 Android.bp/Android.mk files, fox_16.0) and
+          # of vendor/recovery (main) shows NO build rule references
+          # libarchive, libfuse3, rclone, fox-go, ttyd, libuv, json-c or
+          # libwebsockets; only external/libvterm is mandatory ($(error) in
+          # orangefox.mk) and it is public. Removing these makes the project
+          # set identical to the previously-proven-syncable manifest state.
+          # When OrangeFox publishes the repos, the probes below pass and
+          # this overlay becomes a no-op automatically.
+          # -----------------------------------------------------------------
+          python3 - <<'PYEOF'
+          import xml.etree.ElementTree as ET
+          tree = ET.parse("/tmp/combined_manifest.xml")
+          root = tree.getroot()
+          remotes = {r.get("name"): (r.get("fetch") or "").rstrip("/")
+                     for r in root.findall("remote")}
+          default_remote = None
+          d = root.find("default")
+          if d is not None:
+              default_remote = d.get("remote")
+          out = open("/tmp/fox_pins.tsv", "w")
+          count = 0
+          for el in root.findall("project"):
+              name = el.get("name") or el.get("path")
+              remote = el.get("remote") or default_remote
+              fetch = remotes.get(remote, "")
+              if "gitlab.com/OrangeFox" not in fetch:
+                  continue
+              url = fetch + "/" + name
+              rev = el.get("revision") or ""
+              out.write(f"{name}|{url}|{rev}\n")
+              count += 1
+          out.close()
+          print(f"Probing {count} OrangeFox-remote projects for reachability...")
+          PYEOF
+          : > /tmp/fox_probe_result.tsv
+          while IFS='|' read -r NAME URL REV; do
+            OK=0
+            for TRY in 1 2; do
+              if [ "${#REV}" -eq 40 ]; then
+                # SHA-pinned project: probe exactly what repo sync will do.
+                rm -rf /tmp/pin_probe
+                if git init -q /tmp/pin_probe 2>/dev/null && \
+                   timeout 120 git -C /tmp/pin_probe fetch --depth=1 "$URL" "$REV" >/dev/null 2>&1; then
+                  OK=1
+                fi
+                rm -rf /tmp/pin_probe
+              else
+                if timeout 60 git ls-remote "$URL" HEAD >/dev/null 2>&1; then
+                  OK=1
+                fi
+              fi
+              [ "$OK" -eq 1 ] && break
+              sleep 3
+            done
+            echo "$NAME|$OK" >> /tmp/fox_probe_result.tsv
+            if [ "$OK" -eq 1 ]; then
+              echo "  reachable:   $NAME"
+            else
+              echo "  UNREACHABLE: $NAME (repo private/missing, or pinned revision not fetchable)"
+            fi
+          done < /tmp/fox_pins.tsv
+          python3 - <<'PYEOF'
+          import os
+          probe = {}
+          for line in open("/tmp/fox_probe_result.tsv"):
+              name, ok = line.strip().split("|")
+              probe[name] = ok == "1"
+          # Optional OrangeFox extras: absence cannot break the build
+          # (verified against bootable/recovery fox_16.0 + vendor/recovery main).
+          REMOVABLE_OK = {
+              "external/libarchive", "external/libfuse3", "external/fox-go",
+              "external/rclone", "external/ttyd", "external/libuv",
+              "external/json-c", "external/libwebsockets",
+          }
+          removals = set()
+          for name, ok in probe.items():
+              if not ok and name in REMOVABLE_OK:
+                  removals.add(name)
+          # rclone's genrule (fox_nas_rclone_build_defaults) needs the
+          # "fox_go" tool from fox-go: remove them as a pair.
+          if "external/fox-go" in removals:
+              removals.add("external/rclone")
+          for name, ok in probe.items():
+              if not ok and name not in REMOVABLE_OK:
+                  # Core trees: repo init already proved gitlab.com is
+                  # reachable, so this is probe flakiness — warn, do not
+                  # remove, and let repo sync surface the real error.
+                  print(f"  WARNING: {name} probe failed but is not on the removable list; keeping it.")
+          os.makedirs(".repo/local_manifests", exist_ok=True)
+          overlay = ".repo/local_manifests/ci-remove-unreachable-fox-repos.xml"
+          if removals:
+              with open(overlay, "w") as f:
+                  f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+                  f.write("<manifest>\n")
+                  f.write("    <!-- CI-generated: not publicly fetchable at sync time.\n")
+                  f.write("         Safe to remove (no build rule references them). -->\n")
+                  for name in sorted(removals):
+                      f.write(f'    <remove-project name="{name}" />\n')
+                  f.write("</manifest>\n")
+              print("Wrote repair overlay:", overlay)
+              for name in sorted(removals):
+                  print("  removed from sync:", name)
+          else:
+              if os.path.exists(overlay):
+                  os.remove(overlay)
+              print("All OrangeFox repos reachable — no repair overlay needed.")
+          PYEOF
+          if [ -s .repo/local_manifests/ci-remove-unreachable-fox-repos.xml ]; then
+            if repo manifest -o /tmp/combined_manifest2.xml >/dev/null 2>/tmp/repair_check.err; then
+              echo "Manifest after repair: OK ($(grep -c '<project ' /tmp/combined_manifest2.xml) projects)"
+            else
+              echo "ERROR: manifest unparseable after repair overlay:"
+              tail -n 5 /tmp/repair_check.err
+              exit 1
+            fi
+          fi
           # Disk watchdog: prints one df line every 3 minutes so a long sync
           # is always distinguishable from a hung one in the Actions log.
           ( while true; do sleep 180; echo "[disk-watchdog] $(date -u) $(df -h / | tail -n 1)"; done ) &
@@ -170,11 +299,15 @@ jobs:
               3) FLAGS="-c -j2 --no-tags --fail-fast --retry-fetches=5 --no-clone-bundle --force-sync" ;;
             esac
             echo "=== repo sync attempt $ATTEMPT: repo sync $FLAGS ==="
-            if repo sync $FLAGS; then
+            repo sync $FLAGS 2>&1 | tee "/tmp/sync_attempt_$ATTEMPT.log"
+            SYNC_RC=${PIPESTATUS[0]}
+            if [ "$SYNC_RC" -eq 0 ]; then
               SYNC_OK=1
               break
             fi
-            echo "=== attempt $ATTEMPT failed. Resources at failure: ==="
+            echo "=== attempt $ATTEMPT failed (exit code $SYNC_RC). Underlying git errors: ==="
+            grep -iE "fatal:|error:|unable to remote fetch|could not read Username" "/tmp/sync_attempt_$ATTEMPT.log" | sort -u | tail -n 25 || true
+            echo "=== resources at failure: ==="
             free -h || true
             df -h /
             sudo apt-get clean || true
