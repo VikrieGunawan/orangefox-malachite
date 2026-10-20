@@ -82,7 +82,6 @@ if [ "$1" = "$FDEVICE" ] || [ "$FOX_BUILD_DEVICE" = "$FDEVICE" ];
   then
     export TARGET_DEVICE_ALT="malachite"
 
-    # Binaries & Tools
     export FOX_USE_BUSYBOX_BINARY=1
     export FOX_USE_BASH_SHELL=1
     export FOX_USE_TAR_BINARY=1
@@ -98,37 +97,30 @@ if [ "$1" = "$FDEVICE" ] || [ "$FOX_BUILD_DEVICE" = "$FDEVICE" ];
     export FOX_BASH_TO_SYSTEM_BIN=1
     export FOX_REPLACE_TOOLBOX_GETPROP=1
 
-    # Settings/Data storage locations
     export FOX_SETTINGS_ROOT_DIRECTORY="/data/recovery"
     export FOX_MISCELLANEOUS_ROOT_DIRECTORY="/sdcard"
     export FOX_ALLOW_EARLY_SETTINGS_LOAD=1
 
-    # Addons
     export FOX_ENABLE_APP_MANAGER=1
     export FOX_DELETE_AROMAFM=1
     export FOX_NO_BLANK_DT2W=1
 
-    # Magisk / KernelSU(-Next) / SukiSU support
     export FOX_ENABLE_KERNELSU_SUPPORT=1
     export FOX_ENABLE_KERNELSU_NEXT_SUPPORT=1
     export FOX_ENABLE_SUKISU_SUPPORT=1
     export FOX_MOVE_MAGISK_INSTALLER_TO_RAMDISK=1
 
-    # Virtual A/B
     export FOX_VIRTUAL_AB_DEVICE=1
     export FOX_RECOVERY_SYSTEM_PARTITION="/dev/block/mapper/system"
     export FOX_RECOVERY_VENDOR_PARTITION="/dev/block/mapper/vendor"
 
-    # Gunakan magiskboot terbaru (device baru)
     export FOX_USE_UPDATED_MAGISKBOOT=1
 
-    # CCACHE
     export USE_CCACHE=1
     export CCACHE_EXEC="/usr/bin/ccache"
     export CCACHE_MAXSIZE="50G"
     export CCACHE_DIR="/mnt/ccache"
 
-    # Warn if CCACHE_DIR is an invalid directory
     if [ $USE_CCACHE = 1 ] && [ ! -d ${CCACHE_DIR} ];
      then
        echo "W: CCACHE Directory/Partition is not mounted at \"${CCACHE_DIR}\""
@@ -138,10 +130,6 @@ if [ "$1" = "$FDEVICE" ] || [ "$FOX_BUILD_DEVICE" = "$FDEVICE" ];
     export LC_ALL="C"
     export BUILD_USERNAME=malachite
     export BUILD_HOSTNAME=orangefox
-
-    # Debugging
-    ## export FOX_RESET_SETTINGS=0
-    ## export FOX_INSTALLER_DEBUG_MODE=1
 
     if command -v gh > /dev/null 2>&1;
       then fetch_latest_magisk
