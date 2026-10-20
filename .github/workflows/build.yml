@@ -32,6 +32,11 @@ env:
   FOX_BUILD_TYPE: Beta
   # Short label used by the artifact names below (keep in sync with the above)
   ARTIFACT_LABEL: R12.0_0-Beta
+  # ---- Stock OTA (Global) used by the hybrid-assembly step ---------------
+  # Only the vendor_boot partition is pulled out of this payload via HTTP
+  # range requests. Plain HTTP is intentional: the Xiaomi CDN serves plain
+  # HTTP and this avoids TLS stack issues in restricted environments.
+  STOCK_OTA_URL: http://hugeota.d.miui.com/OS2.0.208.0.VOOMIXM/malachite_global-ota_full-OS2.0.208.0.VOOMIXM-user-15.0-4b22dfd9d8.zip
 
 # Never run two builds at once: a new push/dispatch automatically replaces a
 # running build. (The replaced run ends with exit code 143 — that is the normal
@@ -159,26 +164,7 @@ jobs:
                 break
               fi
               echo "  stripping dangling entry: $BAD"
-              BAD="$BAD" python3 - <<'PYEOF'
-          import os, re, glob
-          bad = os.environ["BAD"]
-          m_path = re.search(r'path="([^"]*)"', bad)
-          m_name = re.search(r'name="([^"]*)"', bad)
-          key = (m_path.group(1) if m_path else None) or (m_name.group(1) if m_name else None)
-          if not key:
-              raise SystemExit(0)
-          for f in glob.glob(".repo/manifests/*.xml"):
-              try:
-                  with open(f, encoding="utf-8", errors="replace") as fh:
-                      lines = fh.readlines()
-              except OSError:
-                  continue
-              kept = [l for l in lines if not ("remove-project" in l and key in l)]
-              if len(kept) != len(lines):
-                  with open(f, "w", encoding="utf-8") as fh:
-                      fh.writelines(kept)
-                  print(f"    stripped from {f}")
-          PYEOF
+          printf '%s' 'aW1wb3J0IG9zLCByZSwgZ2xvYgpiYWQgPSBvcy5lbnZpcm9uWyJCQUQiXQptX3BhdGggPSByZS5zZWFyY2gocidwYXRoPSIoW14iXSopIicsIGJhZCkKbV9uYW1lID0gcmUuc2VhcmNoKHInbmFtZT0iKFteIl0qKSInLCBiYWQpCmtleSA9IChtX3BhdGguZ3JvdXAoMSkgaWYgbV9wYXRoIGVsc2UgTm9uZSkgb3IgKG1fbmFtZS5ncm91cCgxKSBpZiBtX25hbWUgZWxzZSBOb25lKQppZiBub3Qga2V5OgogICAgcmFpc2UgU3lzdGVtRXhpdCgwKQpmb3IgZiBpbiBnbG9iLmdsb2IoIi5yZXBvL21hbmlmZXN0cy8qLnhtbCIpOgogICAgdHJ5OgogICAgICAgIHdpdGggb3BlbihmLCBlbmNvZGluZz0idXRmLTgiLCBlcnJvcnM9InJlcGxhY2UiKSBhcyBmaDoKICAgICAgICAgICAgbGluZXMgPSBmaC5yZWFkbGluZXMoKQogICAgZXhjZXB0IE9TRXJyb3I6CiAgICAgICAgY29udGludWUKICAgIGtlcHQgPSBbbCBmb3IgbCBpbiBsaW5lcyBpZiBub3QgKCJyZW1vdmUtcHJvamVjdCIgaW4gbCBhbmQga2V5IGluIGwpXQogICAgaWYgbGVuKGtlcHQpICE9IGxlbihsaW5lcyk6CiAgICAgICAgd2l0aCBvcGVuKGYsICJ3IiwgZW5jb2Rpbmc9InV0Zi04IikgYXMgZmg6CiAgICAgICAgICAgIGZoLndyaXRlbGluZXMoa2VwdCkKICAgICAgICBwcmludChmIiAgICBzdHJpcHBlZCBmcm9tIHtmfSIpCg==' | base64 -d | BAD="$BAD" python3 -
               if repo manifest -o /tmp/combined_manifest.xml >/dev/null 2>/tmp/manifest_check.err; then
                 echo "  manifest parses cleanly now."
                 break
@@ -217,31 +203,7 @@ jobs:
           # When OrangeFox publishes the repos, the probes below pass and
           # this overlay becomes a no-op automatically.
           # -----------------------------------------------------------------
-          python3 - <<'PYEOF'
-          import xml.etree.ElementTree as ET
-          tree = ET.parse("/tmp/combined_manifest.xml")
-          root = tree.getroot()
-          remotes = {r.get("name"): (r.get("fetch") or "").rstrip("/")
-                     for r in root.findall("remote")}
-          default_remote = None
-          d = root.find("default")
-          if d is not None:
-              default_remote = d.get("remote")
-          out = open("/tmp/fox_pins.tsv", "w")
-          count = 0
-          for el in root.findall("project"):
-              name = el.get("name") or el.get("path")
-              remote = el.get("remote") or default_remote
-              fetch = remotes.get(remote, "")
-              if "gitlab.com/OrangeFox" not in fetch:
-                  continue
-              url = fetch + "/" + name
-              rev = el.get("revision") or ""
-              out.write(f"{name}|{url}|{rev}\n")
-              count += 1
-          out.close()
-          print(f"Probing {count} OrangeFox-remote projects for reachability...")
-          PYEOF
+          printf '%s' 'aW1wb3J0IHhtbC5ldHJlZS5FbGVtZW50VHJlZSBhcyBFVAp0cmVlID0gRVQucGFyc2UoIi90bXAvY29tYmluZWRfbWFuaWZlc3QueG1sIikKcm9vdCA9IHRyZWUuZ2V0cm9vdCgpCnJlbW90ZXMgPSB7ci5nZXQoIm5hbWUiKTogKHIuZ2V0KCJmZXRjaCIpIG9yICIiKS5yc3RyaXAoIi8iKQogICAgICAgICAgIGZvciByIGluIHJvb3QuZmluZGFsbCgicmVtb3RlIil9CmRlZmF1bHRfcmVtb3RlID0gTm9uZQpkID0gcm9vdC5maW5kKCJkZWZhdWx0IikKaWYgZCBpcyBub3QgTm9uZToKICAgIGRlZmF1bHRfcmVtb3RlID0gZC5nZXQoInJlbW90ZSIpCm91dCA9IG9wZW4oIi90bXAvZm94X3BpbnMudHN2IiwgInciKQpjb3VudCA9IDAKZm9yIGVsIGluIHJvb3QuZmluZGFsbCgicHJvamVjdCIpOgogICAgbmFtZSA9IGVsLmdldCgibmFtZSIpIG9yIGVsLmdldCgicGF0aCIpCiAgICByZW1vdGUgPSBlbC5nZXQoInJlbW90ZSIpIG9yIGRlZmF1bHRfcmVtb3RlCiAgICBmZXRjaCA9IHJlbW90ZXMuZ2V0KHJlbW90ZSwgIiIpCiAgICBpZiAiZ2l0bGFiLmNvbS9PcmFuZ2VGb3giIG5vdCBpbiBmZXRjaDoKICAgICAgICBjb250aW51ZQogICAgdXJsID0gZmV0Y2ggKyAiLyIgKyBuYW1lCiAgICByZXYgPSBlbC5nZXQoInJldmlzaW9uIikgb3IgIiIKICAgIG91dC53cml0ZShmIntuYW1lfXx7dXJsfXx7cmV2fVxuIikKICAgIGNvdW50ICs9IDEKb3V0LmNsb3NlKCkKcHJpbnQoZiJQcm9iaW5nIHtjb3VudH0gT3JhbmdlRm94LXJlbW90ZSBwcm9qZWN0cyBmb3IgcmVhY2hhYmlsaXR5Li4uIikK' | base64 -d | python3 -
           : > /tmp/fox_probe_result.tsv
           while IFS='|' read -r NAME URL REV; do
             OK=0
@@ -269,52 +231,7 @@ jobs:
               echo "  UNREACHABLE: $NAME (repo private/missing, or pinned revision not fetchable)"
             fi
           done < /tmp/fox_pins.tsv
-          python3 - <<'PYEOF'
-          import os
-          probe = {}
-          for line in open("/tmp/fox_probe_result.tsv"):
-              name, ok = line.strip().split("|")
-              probe[name] = ok == "1"
-          # Optional OrangeFox extras: absence cannot break the build
-          # (verified against bootable/recovery fox_16.0 + vendor/recovery main).
-          REMOVABLE_OK = {
-              "external/libarchive", "external/libfuse3", "external/fox-go",
-              "external/rclone", "external/ttyd", "external/libuv",
-              "external/json-c", "external/libwebsockets",
-          }
-          removals = set()
-          for name, ok in probe.items():
-              if not ok and name in REMOVABLE_OK:
-                  removals.add(name)
-          # rclone's genrule (fox_nas_rclone_build_defaults) needs the
-          # "fox_go" tool from fox-go: remove them as a pair.
-          if "external/fox-go" in removals:
-              removals.add("external/rclone")
-          for name, ok in probe.items():
-              if not ok and name not in REMOVABLE_OK:
-                  # Core trees: repo init already proved gitlab.com is
-                  # reachable, so this is probe flakiness — warn, do not
-                  # remove, and let repo sync surface the real error.
-                  print(f"  WARNING: {name} probe failed but is not on the removable list; keeping it.")
-          os.makedirs(".repo/local_manifests", exist_ok=True)
-          overlay = ".repo/local_manifests/ci-remove-unreachable-fox-repos.xml"
-          if removals:
-              with open(overlay, "w") as f:
-                  f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-                  f.write("<manifest>\n")
-                  f.write("    <!-- CI-generated: not publicly fetchable at sync time.\n")
-                  f.write("         Safe to remove (no build rule references them). -->\n")
-                  for name in sorted(removals):
-                      f.write(f'    <remove-project name="{name}" />\n')
-                  f.write("</manifest>\n")
-              print("Wrote repair overlay:", overlay)
-              for name in sorted(removals):
-                  print("  removed from sync:", name)
-          else:
-              if os.path.exists(overlay):
-                  os.remove(overlay)
-              print("All OrangeFox repos reachable — no repair overlay needed.")
-          PYEOF
+          printf '%s' 'aW1wb3J0IG9zCnByb2JlID0ge30KZm9yIGxpbmUgaW4gb3BlbigiL3RtcC9mb3hfcHJvYmVfcmVzdWx0LnRzdiIpOgogICAgbmFtZSwgb2sgPSBsaW5lLnN0cmlwKCkuc3BsaXQoInwiKQogICAgcHJvYmVbbmFtZV0gPSBvayA9PSAiMSIKIyBPcHRpb25hbCBPcmFuZ2VGb3ggZXh0cmFzOiBhYnNlbmNlIGNhbm5vdCBicmVhayB0aGUgYnVpbGQKIyAodmVyaWZpZWQgYWdhaW5zdCBib290YWJsZS9yZWNvdmVyeSBmb3hfMTYuMCArIHZlbmRvci9yZWNvdmVyeSBtYWluKS4KUkVNT1ZBQkxFX09LID0gewogICAgImV4dGVybmFsL2xpYmFyY2hpdmUiLCAiZXh0ZXJuYWwvbGliZnVzZTMiLCAiZXh0ZXJuYWwvZm94LWdvIiwKICAgICJleHRlcm5hbC9yY2xvbmUiLCAiZXh0ZXJuYWwvdHR5ZCIsICJleHRlcm5hbC9saWJ1diIsCiAgICAiZXh0ZXJuYWwvanNvbi1jIiwgImV4dGVybmFsL2xpYndlYnNvY2tldHMiLAp9CnJlbW92YWxzID0gc2V0KCkKZm9yIG5hbWUsIG9rIGluIHByb2JlLml0ZW1zKCk6CiAgICBpZiBub3Qgb2sgYW5kIG5hbWUgaW4gUkVNT1ZBQkxFX09LOgogICAgICAgIHJlbW92YWxzLmFkZChuYW1lKQojIHJjbG9uZSdzIGdlbnJ1bGUgKGZveF9uYXNfcmNsb25lX2J1aWxkX2RlZmF1bHRzKSBuZWVkcyB0aGUKIyAiZm94X2dvIiB0b29sIGZyb20gZm94LWdvOiByZW1vdmUgdGhlbSBhcyBhIHBhaXIuCmlmICJleHRlcm5hbC9mb3gtZ28iIGluIHJlbW92YWxzOgogICAgcmVtb3ZhbHMuYWRkKCJleHRlcm5hbC9yY2xvbmUiKQpmb3IgbmFtZSwgb2sgaW4gcHJvYmUuaXRlbXMoKToKICAgIGlmIG5vdCBvayBhbmQgbmFtZSBub3QgaW4gUkVNT1ZBQkxFX09LOgogICAgICAgICMgQ29yZSB0cmVlczogcmVwbyBpbml0IGFscmVhZHkgcHJvdmVkIGdpdGxhYi5jb20gaXMKICAgICAgICAjIHJlYWNoYWJsZSwgc28gdGhpcyBpcyBwcm9iZSBmbGFraW5lc3Mg4oCUIHdhcm4sIGRvIG5vdAogICAgICAgICMgcmVtb3ZlLCBhbmQgbGV0IHJlcG8gc3luYyBzdXJmYWNlIHRoZSByZWFsIGVycm9yLgogICAgICAgIHByaW50KGYiICBXQVJOSU5HOiB7bmFtZX0gcHJvYmUgZmFpbGVkIGJ1dCBpcyBub3Qgb24gdGhlIHJlbW92YWJsZSBsaXN0OyBrZWVwaW5nIGl0LiIpCm9zLm1ha2VkaXJzKCIucmVwby9sb2NhbF9tYW5pZmVzdHMiLCBleGlzdF9vaz1UcnVlKQpvdmVybGF5ID0gIi5yZXBvL2xvY2FsX21hbmlmZXN0cy9jaS1yZW1vdmUtdW5yZWFjaGFibGUtZm94LXJlcG9zLnhtbCIKaWYgcmVtb3ZhbHM6CiAgICB3aXRoIG9wZW4ob3ZlcmxheSwgInciKSBhcyBmOgogICAgICAgIGYud3JpdGUoJzw/eG1sIHZlcnNpb249IjEuMCIgZW5jb2Rpbmc9IlVURi04Ij8+XG4nKQogICAgICAgIGYud3JpdGUoIjxtYW5pZmVzdD5cbiIpCiAgICAgICAgZi53cml0ZSgiICAgIDwhLS0gQ0ktZ2VuZXJhdGVkOiBub3QgcHVibGljbHkgZmV0Y2hhYmxlIGF0IHN5bmMgdGltZS5cbiIpCiAgICAgICAgZi53cml0ZSgiICAgICAgICAgU2FmZSB0byByZW1vdmUgKG5vIGJ1aWxkIHJ1bGUgcmVmZXJlbmNlcyB0aGVtKS4gLS0+XG4iKQogICAgICAgIGZvciBuYW1lIGluIHNvcnRlZChyZW1vdmFscyk6CiAgICAgICAgICAgIGYud3JpdGUoZicgICAgPHJlbW92ZS1wcm9qZWN0IG5hbWU9IntuYW1lfSIgLz5cbicpCiAgICAgICAgZi53cml0ZSgiPC9tYW5pZmVzdD5cbiIpCiAgICBwcmludCgiV3JvdGUgcmVwYWlyIG92ZXJsYXk6Iiwgb3ZlcmxheSkKICAgIGZvciBuYW1lIGluIHNvcnRlZChyZW1vdmFscyk6CiAgICAgICAgcHJpbnQoIiAgcmVtb3ZlZCBmcm9tIHN5bmM6IiwgbmFtZSkKZWxzZToKICAgIGlmIG9zLnBhdGguZXhpc3RzKG92ZXJsYXkpOgogICAgICAgIG9zLnJlbW92ZShvdmVybGF5KQogICAgcHJpbnQoIkFsbCBPcmFuZ2VGb3ggcmVwb3MgcmVhY2hhYmxlIOKAlCBubyByZXBhaXIgb3ZlcmxheSBuZWVkZWQuIikK' | base64 -d | python3 -
           if [ -s .repo/local_manifests/ci-remove-unreachable-fox-repos.xml ]; then
             if repo manifest -o /tmp/combined_manifest2.xml >/dev/null 2>/tmp/repair_check.err; then
               echo "Manifest after repair: OK ($(grep -c '<project ' /tmp/combined_manifest2.xml) projects)"
@@ -439,33 +356,7 @@ jobs:
           #   skipping would burn a 40-minute sync on another OOM.
           # -----------------------------------------------------------------
           cd "$REPO_DIR"
-          python3 - <<'SOONGEOF'
-          import os, re
-          path = "build/soong/cmd/soong_build/main.go"
-          if not os.path.exists(path):
-              raise SystemExit("FAIL-FAST: %s not found - soong entry point moved "
-                               "upstream; cannot apply the memory-limit patch." % path)
-          src = open(path, encoding="utf-8").read()
-          if "debug.SetMemoryLimit" in src:
-              print("soong_build main.go already patched (debug.SetMemoryLimit present).")
-              raise SystemExit(0)
-          # 1) make sure the runtime/debug import exists
-          if '"runtime/debug"' not in src:
-              m = re.search(r'import \(\n', src)
-              if not m:
-                  raise SystemExit("FAIL-FAST: no 'import (' block found in %s" % path)
-              src = src[:m.end()] + '\t"runtime/debug"\n' + src[m.end():]
-          # 2) inject the limit as the first statement of main()
-          m = re.search(r'func main\(\) \{\n', src)
-          if not m:
-              raise SystemExit("FAIL-FAST: no 'func main() {' anchor found in %s" % path)
-          injection = ('\t// CI: hard Go heap limit - soong_ui launches this binary via '
-                       '"env -i" which strips GOMEMLIMIT, see workflow.\n'
-                       '\tdebug.SetMemoryLimit(14 << 30)\n\n')
-          src = src[:m.end()] + injection + src[m.end():]
-          open(path, "w", encoding="utf-8").write(src)
-          print("Patched %s -> debug.SetMemoryLimit(14 << 30)" % path)
-          SOONGEOF
+          printf '%s' 'aW1wb3J0IG9zLCByZQpwYXRoID0gImJ1aWxkL3Nvb25nL2NtZC9zb29uZ19idWlsZC9tYWluLmdvIgppZiBub3Qgb3MucGF0aC5leGlzdHMocGF0aCk6CiAgICByYWlzZSBTeXN0ZW1FeGl0KCJGQUlMLUZBU1Q6ICVzIG5vdCBmb3VuZCAtIHNvb25nIGVudHJ5IHBvaW50IG1vdmVkICIKICAgICAgICAgICAgICAgICAgICAgInVwc3RyZWFtOyBjYW5ub3QgYXBwbHkgdGhlIG1lbW9yeS1saW1pdCBwYXRjaC4iICUgcGF0aCkKc3JjID0gb3BlbihwYXRoLCBlbmNvZGluZz0idXRmLTgiKS5yZWFkKCkKaWYgImRlYnVnLlNldE1lbW9yeUxpbWl0IiBpbiBzcmM6CiAgICBwcmludCgic29vbmdfYnVpbGQgbWFpbi5nbyBhbHJlYWR5IHBhdGNoZWQgKGRlYnVnLlNldE1lbW9yeUxpbWl0IHByZXNlbnQpLiIpCiAgICByYWlzZSBTeXN0ZW1FeGl0KDApCiMgMSkgbWFrZSBzdXJlIHRoZSBydW50aW1lL2RlYnVnIGltcG9ydCBleGlzdHMKaWYgJyJydW50aW1lL2RlYnVnIicgbm90IGluIHNyYzoKICAgIG0gPSByZS5zZWFyY2gocidpbXBvcnQgXChcbicsIHNyYykKICAgIGlmIG5vdCBtOgogICAgICAgIHJhaXNlIFN5c3RlbUV4aXQoIkZBSUwtRkFTVDogbm8gJ2ltcG9ydCAoJyBibG9jayBmb3VuZCBpbiAlcyIgJSBwYXRoKQogICAgc3JjID0gc3JjWzptLmVuZCgpXSArICdcdCJydW50aW1lL2RlYnVnIlxuJyArIHNyY1ttLmVuZCgpOl0KIyAyKSBpbmplY3QgdGhlIGxpbWl0IGFzIHRoZSBmaXJzdCBzdGF0ZW1lbnQgb2YgbWFpbigpCm0gPSByZS5zZWFyY2gocidmdW5jIG1haW5cKFwpIFx7XG4nLCBzcmMpCmlmIG5vdCBtOgogICAgcmFpc2UgU3lzdGVtRXhpdCgiRkFJTC1GQVNUOiBubyAnZnVuYyBtYWluKCkgeycgYW5jaG9yIGZvdW5kIGluICVzIiAlIHBhdGgpCmluamVjdGlvbiA9ICgnXHQvLyBDSTogaGFyZCBHbyBoZWFwIGxpbWl0IC0gc29vbmdfdWkgbGF1bmNoZXMgdGhpcyBiaW5hcnkgdmlhICcKICAgICAgICAgICAgICciZW52IC1pIiB3aGljaCBzdHJpcHMgR09NRU1MSU1JVCwgc2VlIHdvcmtmbG93LlxuJwogICAgICAgICAgICAgJ1x0ZGVidWcuU2V0TWVtb3J5TGltaXQoMTQgPDwgMzApXG5cbicpCnNyYyA9IHNyY1s6bS5lbmQoKV0gKyBpbmplY3Rpb24gKyBzcmNbbS5lbmQoKTpdCm9wZW4ocGF0aCwgInciLCBlbmNvZGluZz0idXRmLTgiKS53cml0ZShzcmMpCnByaW50KCJQYXRjaGVkICVzIC0+IGRlYnVnLlNldE1lbW9yeUxpbWl0KDE0IDw8IDMwKSIgJSBwYXRoKQo=' | base64 -d | python3 -
           echo "Patch verification (soong_build main.go):"
           grep -n "SetMemoryLimit\|runtime/debug" build/soong/cmd/soong_build/main.go
 
@@ -488,29 +379,7 @@ jobs:
           # checks ("Don't check ramdisk or recovery variants") and the dumps
           # produce no runtime artifact. Fail-fast if upstream moved the hatch.
           # -----------------------------------------------------------------
-          python3 - <<'SABIEOF'
-          import os
-          path = "build/soong/cc/sabi.go"
-          if not os.path.exists(path):
-              raise SystemExit("FAIL-FAST: %s not found - upstream moved the ABI "
-                               "gate; cannot apply the SKIP_ABI_CHECKS patch." % path)
-          src = open(path, encoding="utf-8").read()
-          needle = 'ctx.Config().IsEnvTrue("SKIP_ABI_CHECKS")'
-          n = src.count(needle)
-          if n == 0:
-              if "SKIP_ABI_CHECKS" in src:
-                  raise SystemExit("FAIL-FAST: %s mentions SKIP_ABI_CHECKS in an "
-                                   "unexpected form; the escape hatch changed "
-                                   "upstream - refusing to guess." % path)
-              print("sabi.go already patched (ABI gate disabled).")
-              raise SystemExit(0)
-          if n != 2:
-              raise SystemExit("FAIL-FAST: expected 2 occurrences of the ABI escape "
-                               "hatch in %s, found %d - refusing to blind-patch." % (path, n))
-          src = src.replace(needle, 'true /* CI: ABI gate disabled */')
-          open(path, "w", encoding="utf-8").write(src)
-          print("Patched %s: ABI gate disabled at both mutator sites." % path)
-          SABIEOF
+          printf '%s' 'aW1wb3J0IG9zCnBhdGggPSAiYnVpbGQvc29vbmcvY2Mvc2FiaS5nbyIKaWYgbm90IG9zLnBhdGguZXhpc3RzKHBhdGgpOgogICAgcmFpc2UgU3lzdGVtRXhpdCgiRkFJTC1GQVNUOiAlcyBub3QgZm91bmQgLSB1cHN0cmVhbSBtb3ZlZCB0aGUgQUJJICIKICAgICAgICAgICAgICAgICAgICAgImdhdGU7IGNhbm5vdCBhcHBseSB0aGUgU0tJUF9BQklfQ0hFQ0tTIHBhdGNoLiIgJSBwYXRoKQpzcmMgPSBvcGVuKHBhdGgsIGVuY29kaW5nPSJ1dGYtOCIpLnJlYWQoKQpuZWVkbGUgPSAnY3R4LkNvbmZpZygpLklzRW52VHJ1ZSgiU0tJUF9BQklfQ0hFQ0tTIiknCm4gPSBzcmMuY291bnQobmVlZGxlKQppZiBuID09IDA6CiAgICBpZiAiU0tJUF9BQklfQ0hFQ0tTIiBpbiBzcmM6CiAgICAgICAgcmFpc2UgU3lzdGVtRXhpdCgiRkFJTC1GQVNUOiAlcyBtZW50aW9ucyBTS0lQX0FCSV9DSEVDS1MgaW4gYW4gIgogICAgICAgICAgICAgICAgICAgICAgICAgInVuZXhwZWN0ZWQgZm9ybTsgdGhlIGVzY2FwZSBoYXRjaCBjaGFuZ2VkICIKICAgICAgICAgICAgICAgICAgICAgICAgICJ1cHN0cmVhbSAtIHJlZnVzaW5nIHRvIGd1ZXNzLiIgJSBwYXRoKQogICAgcHJpbnQoInNhYmkuZ28gYWxyZWFkeSBwYXRjaGVkIChBQkkgZ2F0ZSBkaXNhYmxlZCkuIikKICAgIHJhaXNlIFN5c3RlbUV4aXQoMCkKaWYgbiAhPSAyOgogICAgcmFpc2UgU3lzdGVtRXhpdCgiRkFJTC1GQVNUOiBleHBlY3RlZCAyIG9jY3VycmVuY2VzIG9mIHRoZSBBQkkgZXNjYXBlICIKICAgICAgICAgICAgICAgICAgICAgImhhdGNoIGluICVzLCBmb3VuZCAlZCAtIHJlZnVzaW5nIHRvIGJsaW5kLXBhdGNoLiIgJSAocGF0aCwgbikpCnNyYyA9IHNyYy5yZXBsYWNlKG5lZWRsZSwgJ3RydWUgLyogQ0k6IEFCSSBnYXRlIGRpc2FibGVkICovJykKb3BlbihwYXRoLCAidyIsIGVuY29kaW5nPSJ1dGYtOCIpLndyaXRlKHNyYykKcHJpbnQoIlBhdGNoZWQgJXM6IEFCSSBnYXRlIGRpc2FibGVkIGF0IGJvdGggbXV0YXRvciBzaXRlcy4iICUgcGF0aCkK' | base64 -d | python3 -
           echo "Patch verification (soong cc/sabi.go):"
           grep -n "CI: ABI gate disabled" build/soong/cc/sabi.go
 
@@ -546,26 +415,7 @@ jobs:
           # (device/xiaomi/mondrian), adapted for an A/B vendor_boot-only device:
           # no OF_AB_DEVICE_WITH_RECOVERY_PARTITION here, because malachite has
           # no dedicated recovery partition (recovery lives in vendor_boot).
-          cat >> "$REPO_DIR/$DEVICE_PATH/BoardConfig.mk" <<EOF
-
-          # ---- OrangeFox Recovery (fox_16.0) ----
-          # fox_16.0 renamed OF_AB_DEVICE to FOX_AB_DEVICE (the old spelling is
-          # a hard kati error). FOX_AB_DEVICE is also auto-set by orangefox.mk
-          # because device.mk sets AB_OTA_UPDATER := true, and it is exported by
-          # the derived vendorsetup.sh below; the explicit assignment keeps the
-          # configuration self-sufficient even if those two paths change.
-          FOX_AB_DEVICE := 1
-          OF_SCREEN_H := 2712
-          OF_STATUS_INDENT_LEFT := 48
-          OF_STATUS_INDENT_RIGHT := 48
-          OF_CLOCK_POS := 1
-          OF_ADVANCED_SECURITY := 1
-          # String values must stay UNQUOTED: the OrangeFox build glue wraps
-          # each value in C quotes when emitting -D flags. A quoted value
-          # here produced ""..."" and failed C++11 compilation with
-          # "invalid suffix on literal" (orscmd.cpp, measured 2026-10-20).
-          OF_MAINTAINER := $MAINTAINER
-          EOF
+          printf '%s' 'CiMgLS0tLSBPcmFuZ2VGb3ggUmVjb3ZlcnkgKGZveF8xNi4wKSAtLS0tCiMgZm94XzE2LjAgcmVuYW1lZCBPRl9BQl9ERVZJQ0UgdG8gRk9YX0FCX0RFVklDRSAodGhlIG9sZCBzcGVsbGluZyBpcwojIGEgaGFyZCBrYXRpIGVycm9yKS4gRk9YX0FCX0RFVklDRSBpcyBhbHNvIGF1dG8tc2V0IGJ5IG9yYW5nZWZveC5tawojIGJlY2F1c2UgZGV2aWNlLm1rIHNldHMgQUJfT1RBX1VQREFURVIgOj0gdHJ1ZSwgYW5kIGl0IGlzIGV4cG9ydGVkIGJ5CiMgdGhlIGRlcml2ZWQgdmVuZG9yc2V0dXAuc2ggYmVsb3c7IHRoZSBleHBsaWNpdCBhc3NpZ25tZW50IGtlZXBzIHRoZQojIGNvbmZpZ3VyYXRpb24gc2VsZi1zdWZmaWNpZW50IGV2ZW4gaWYgdGhvc2UgdHdvIHBhdGhzIGNoYW5nZS4KRk9YX0FCX0RFVklDRSA6PSAxCk9GX1NDUkVFTl9IIDo9IDI3MTIKT0ZfU1RBVFVTX0lOREVOVF9MRUZUIDo9IDQ4Ck9GX1NUQVRVU19JTkRFTlRfUklHSFQgOj0gNDgKT0ZfQ0xPQ0tfUE9TIDo9IDEKT0ZfQURWQU5DRURfU0VDVVJJVFkgOj0gMQojIFN0cmluZyB2YWx1ZXMgbXVzdCBzdGF5IFVOUVVPVEVEOiB0aGUgT3JhbmdlRm94IGJ1aWxkIGdsdWUgd3JhcHMKIyBlYWNoIHZhbHVlIGluIEMgcXVvdGVzIHdoZW4gZW1pdHRpbmcgLUQgZmxhZ3MuIEEgcXVvdGVkIHZhbHVlCiMgaGVyZSBwcm9kdWNlZCAiIi4uLiIiIGFuZCBmYWlsZWQgQysrMTEgY29tcGlsYXRpb24gd2l0aAojICJpbnZhbGlkIHN1ZmZpeCBvbiBsaXRlcmFsIiAob3JzY21kLmNwcCwgbWVhc3VyZWQgMjAyNi0xMC0yMCkuCk9GX01BSU5UQUlORVIgOj0gJE1BSU5UQUlORVIK' | base64 -d >> "$REPO_DIR/$DEVICE_PATH/BoardConfig.mk"
           echo "OrangeFox configuration appended:"
           tail -18 "$REPO_DIR/$DEVICE_PATH/BoardConfig.mk"
           # -----------------------------------------------------------------
@@ -588,11 +438,7 @@ jobs:
           else
             PRODUCT_MK="$REPO_DIR/$DEVICE_PATH/device.mk"
           fi
-          cat >> "$PRODUCT_MK" <<EOF
-
-          # Fix for the A16 CrashRecovery soong error (added by CI)
-          PRODUCT_APEX_SYSTEM_SERVER_JARS += com.android.crashrecovery:service-crashrecovery
-          EOF
+          printf '%s' 'CiMgRml4IGZvciB0aGUgQTE2IENyYXNoUmVjb3Zlcnkgc29vbmcgZXJyb3IgKGFkZGVkIGJ5IENJKQpQUk9EVUNUX0FQRVhfU1lTVEVNX1NFUlZFUl9KQVJTICs9IGNvbS5hbmRyb2lkLmNyYXNocmVjb3Zlcnk6c2VydmljZS1jcmFzaHJlY292ZXJ5Cg==' | base64 -d >> "$PRODUCT_MK"
           echo "CrashRecovery PRODUCT_APEX_SYSTEM_SERVER_JARS fix appended to $PRODUCT_MK:"
           tail -4 "$PRODUCT_MK"
           # Official fox_16.0 device trees ship a vendorsetup.sh that exports
@@ -657,20 +503,7 @@ jobs:
           if grep -qF 'FOX-MALACHITE-CI: target_board_api_level pinned' "$MACROS"; then
             echo "flagging_macros already pinned (idempotent rerun)"
           else
-            cat >> "$MACROS" <<'EOF'
-
-          # ==== FOX-MALACHITE-CI: target_board_api_level pinned to 202504 ====
-          # fox_16.0 = android-16.0.0_r1: system/sepolicy/vendor/*.te reference
-          # hal_hwcrypto / hal_mediaquality / hal_vm_capabilities /
-          # tee_service_type, which public policy declares only inside
-          # starting_at_board_api(202504, ...). Google builds this tag with
-          # BOARD_API_LEVEL=202504; TWRP device trees do not set BOARD_API_LEVEL,
-          # so system/sepolicy/build/soong/selinux.go injects a lower
-          # -D target_board_api_level and checkpolicy fails with
-          # "attribute hal_hwcrypto_server is not declared".
-          # In m4 a later define() overrides the -D command-line define.
-          define(`target_board_api_level', `202504')
-          EOF
+          printf '%s' 'CiMgPT09PSBGT1gtTUFMQUNISVRFLUNJOiB0YXJnZXRfYm9hcmRfYXBpX2xldmVsIHBpbm5lZCB0byAyMDI1MDQgPT09PQojIGZveF8xNi4wID0gYW5kcm9pZC0xNi4wLjBfcjE6IHN5c3RlbS9zZXBvbGljeS92ZW5kb3IvKi50ZSByZWZlcmVuY2UKIyBoYWxfaHdjcnlwdG8gLyBoYWxfbWVkaWFxdWFsaXR5IC8gaGFsX3ZtX2NhcGFiaWxpdGllcyAvCiMgdGVlX3NlcnZpY2VfdHlwZSwgd2hpY2ggcHVibGljIHBvbGljeSBkZWNsYXJlcyBvbmx5IGluc2lkZQojIHN0YXJ0aW5nX2F0X2JvYXJkX2FwaSgyMDI1MDQsIC4uLikuIEdvb2dsZSBidWlsZHMgdGhpcyB0YWcgd2l0aAojIEJPQVJEX0FQSV9MRVZFTD0yMDI1MDQ7IFRXUlAgZGV2aWNlIHRyZWVzIGRvIG5vdCBzZXQgQk9BUkRfQVBJX0xFVkVMLAojIHNvIHN5c3RlbS9zZXBvbGljeS9idWlsZC9zb29uZy9zZWxpbnV4LmdvIGluamVjdHMgYSBsb3dlcgojIC1EIHRhcmdldF9ib2FyZF9hcGlfbGV2ZWwgYW5kIGNoZWNrcG9saWN5IGZhaWxzIHdpdGgKIyAiYXR0cmlidXRlIGhhbF9od2NyeXB0b19zZXJ2ZXIgaXMgbm90IGRlY2xhcmVkIi4KIyBJbiBtNCBhIGxhdGVyIGRlZmluZSgpIG92ZXJyaWRlcyB0aGUgLUQgY29tbWFuZC1saW5lIGRlZmluZS4KZGVmaW5lKGB0YXJnZXRfYm9hcmRfYXBpX2xldmVsJywgYDIwMjUwNCcpCg==' | base64 -d >> "$MACROS"
           fi
           echo "Pinned flagging_macros (tail):"
           tail -n 13 "$MACROS"
@@ -682,10 +515,7 @@ jobs:
           # -----------------------------------------------------------------
           TESTDIR="$(mktemp -d)"
           cp "$MACROS" "$TESTDIR/flagging_macros"
-          cat > "$TESTDIR/use.te" <<'USEEOF'
-          starting_at_board_api(202504, `PIN_202504_EXPANDED_OK')
-          until_board_api(202504, `WRONG_UNTIL_202504_EXPANDED')
-          USEEOF
+          printf '%s' 'c3RhcnRpbmdfYXRfYm9hcmRfYXBpKDIwMjUwNCwgYFBJTl8yMDI1MDRfRVhQQU5ERURfT0snKQp1bnRpbF9ib2FyZF9hcGkoMjAyNTA0LCBgV1JPTkdfVU5USUxfMjAyNTA0X0VYUEFOREVEJykK' | base64 -d > "$TESTDIR/use.te"
           OUT="$(m4 -D target_board_api_level=34 "$TESTDIR/flagging_macros" "$TESTDIR/use.te")"
           echo "m4 self-test output: $OUT"
           if echo "$OUT" | grep -q PIN_202504_EXPANDED_OK && \
@@ -894,6 +724,131 @@ jobs:
             exit 1
           fi
           echo "Build finished OK: $(date -u)"
+
+      # -------------------------------------------------------------------
+      # ASSEMBLE HYBRID vendor_boot - THE PRIMARY FLASH TARGET.
+      #
+      # GROUND TRUTH (real stock vendor_boot, HyperOS 2.0.208.0 Global, parsed
+      # by the embedded assembler): the stock vendor_ramdisk table is
+      #   [ PLATFORM (unnamed, 30.9 MB) ] + [ "recovery" type-2 (13.9 MB) ]
+      # i.e. malachite uses the GKI SEPARATE-RECOVERY-FRAGMENT convention.
+      # Field result: the merged-design OrangeFox vendor_boot (recovery rootfs
+      # merged INTO the PLATFORM fragment) killed BOTH recovery AND normal
+      # boot - recovery files loaded during normal boot and TWRP vendor bits
+      # overwrote the stock ones. This step therefore builds a "hybrid" that
+      # keeps the system boot path 100% stock:
+      #   * PLATFORM fragment + DTB + cmdline + bootconfig: byte-identical to
+      #     STOCK (extracted from the official Global OTA via parallel HTTP
+      #     range streaming with SHA-256 verification).
+      #   * The stock type-2 RECOVERY fragment entry keeps its name, type and
+      #     board_id, but its CONTENT is replaced with the OrangeFox recovery
+      #     rootfs. Bootloaders load RECOVERY fragments only in recovery mode
+      #     - exactly the stock mechanism - so normal boot is untouched and
+      #     recovery boot boots OrangeFox.
+      # The result is re-parsed and self-verified (25+ structural checks) and
+      # passed through avbtool verify_image before publication. If the stock
+      # OTA extraction fails (CDN hiccup) the job CONTINUES and ships the
+      # merged-design image only, with a loud warning in the run summary.
+      # -------------------------------------------------------------------
+      - name: Assemble hybrid vendor_boot (stock platform + OrangeFox recovery)
+        run: |
+          set -e
+          TREE="$GITHUB_WORKSPACE/workspace/fox_16.0"
+          OUT="$TREE/out/target/product/$DEVICE_CODENAME"
+          ART="$GITHUB_WORKSPACE/artifacts"
+          TMPH="$(mktemp -d)"
+          mkdir -p "$ART" "$TMPH/asm"
+          RR="$OUT/recovery/root"
+
+          if [ ! -f "$RR/system/bin/recovery" ]; then
+            echo "=================================================================="
+            echo "WARNING: $RR/system/bin/recovery not found."
+            echo "The build did not populate the recovery root - hybrid assembly"
+            echo "SKIPPED. Only the merged-design vendor_boot will be uploaded."
+            echo "=================================================================="
+            {
+              echo "### WARNING: hybrid assembly SKIPPED"
+              echo ""
+              echo "\`$RR/system/bin/recovery\` was not found, so only the"
+              echo "merged-design vendor_boot.img was produced this run."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "== 1/5 Downloading extraction + AVB tools (pinned versions) =="
+          curl -fsSL --retry 3 -o "$TMPH/otari.tar.gz" \
+            https://github.com/syedinsaf/otaripper/releases/download/v3.5.0/otaripper-3.5.0-linux-x86_64.tar.gz
+          tar xzf "$TMPH/otari.tar.gz" -C "$TMPH"
+          OTARI="$TMPH/otaripper"
+          test -x "$OTARI" || { echo "otaripper binary not found:"; ls -la "$TMPH"; exit 1; }
+          curl -fsSL --retry 3 -o "$TMPH/avbtool.py" \
+            https://raw.githubusercontent.com/LineageOS/android_external_avb/lineage-23.0/avbtool.py
+
+          echo "== 2/5 Extracting STOCK vendor_boot from the Global OTA (parallel range streaming) =="
+          mkdir -p "$TMPH/stock"
+          STOCK="$TMPH/stock/vendor_boot.img"
+          # otaripper streams only the vendor_boot byte-ranges over parallel
+          # 8 MB HTTP chunked requests and SHA-256-verifies the output.
+          if ! "$OTARI" "$STOCK_OTA_URL" -o "$TMPH/stock" -p vendor_boot -n; then
+            echo "Extraction attempt 1 failed - retrying once after 20 s..."
+            sleep 20
+            if ! "$OTARI" "$STOCK_OTA_URL" -o "$TMPH/stock" -p vendor_boot -n; then
+              echo "=================================================================="
+              echo "WARNING: stock vendor_boot extraction FAILED (CDN unreachable?)."
+              echo "Hybrid assembly SKIPPED. Only the merged-design image ships."
+              echo "=================================================================="
+              {
+                echo "### WARNING: hybrid assembly SKIPPED - stock OTA extraction failed"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          fi
+          # otaripper menulis ke <out>/extracted_<timestamp>/vendor_boot.img -
+          # resolusikan lokasi nyata-nya (path tidak deterministik).
+          STOCK="$(find "$TMPH/stock" -type f -name vendor_boot.img | head -n1)"
+          test -n "$STOCK" && test -s "$STOCK" || { echo "extracted vendor_boot.img not found:"; find "$TMPH/stock" -maxdepth 3; exit 1; }
+          echo "Stock vendor_boot extracted: $(stat -c%s "$STOCK") bytes"
+
+          echo "== 3/5 Writing the hybrid assembler (base64-embedded) =="
+          printf '%s' 'IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwojIC0qLSBjb2Rpbmc6IHV0Zi04IC0qLQoiIiIKYnVpbGRfaHlicmlkX3ZiLnB5IOKAlCBBc3NlbWJsZXIgdmVuZG9yX2Jvb3QgR0tJIHY0ICJoaWJyaWRhIiB1bnR1ayBtYWxhY2hpdGUuCgpHUk9VTkQgVFJVVEggc3RvayBtYWxhY2hpdGUgKEh5cGVyT1MgMi4wLjIwOC4wIEdsb2JhbCwgZGliZWRhaCBsYW5nc3VuZyk6CiAgdGFiZWwgdmVuZG9yX3JhbWRpc2sgPSBbUExBVEZPUk0gdGFucGEtbmFtYSAzMCw5IE1CXSArIFsicmVjb3ZlcnkiIHR5cGUtMgogIDEzLDkgTUJdIOKAlCBzdG9rIG1lbWFrYWkga29udmVuc2kgR0tJIGZyYWdtZW50IFJFQ09WRVJZIFRFUlBJU0FIIChidWthbgogIGRlc2FpbiBnYWJ1bmcta2UtUExBVEZPUk0pLCBibG9iIERUQiBNVEsgYmVycHJlYW1ibGUgNjQgYnl0ZSwgYm9vdGNvbmZpZwogIGtvc29uZywgZm9vdGVyIEFWQmYgdjEuMC4KCk1hc2FsYWggeWFuZyBkaXNlbGVzYWlrYW46CiAgdmVuZG9yX2Jvb3QgT3JhbmdlRm94IGhhc2lsIGJ1aWxkIChyZWNvdmVyeSByb290ZnMgZGlsZWJ1ciBrZSBmcmFnbWVudAogIFBMQVRGT1JNKSB0ZXJidWt0aSBtZW1idWF0IHJlY292ZXJ5IERBTiBzaXN0ZW0gc2FtYS1zYW1hIGdhZ2FsIGJvb3Qg4oCUIGZpbGUKICByZWNvdmVyeSBpa3V0IHRlcm11YXQgc2FhdCBib290IG5vcm1hbCBkYW4gdmVuZG9yLWJpdHMgVFdSUCBtZW5pbXBhCiAgdmVuZG9yLWJpdHMgc3Rvay4gSW1hZ2UgaGlicmlkYSBtZW51dHVwIHNlbXVhbnlhOgoKICAgIDEuIEtvbXBvc2lzaSByYW1kaXNrIDogZnJhZ21lbnQgUExBVEZPUk0gKGRhbiBsYWlubnlhKSBkaXBlcnRhaGFua2FuCiAgICAgICAgICAgICAgICAgICAgICAgICAgIFZFUkJBVElNIChib290IG5vcm1hbCA9IHBlcmlsYWt1IHN0b2sgMTAwJSkuCiAgICAyLiBSZWNvdmVyeSAgICAgICAgICA6IElTSSBmcmFnbWVudCBSRUNPVkVSWSBzdG9rIERJR0FOVEkgcm9vdGZzCiAgICAgICAgICAgICAgICAgICAgICAgICAgIHJlY292ZXJ5IE9yYW5nZUZveCDigJQgbmFtZS90eXBlL2JvYXJkX2lkIGVudHJpCiAgICAgICAgICAgICAgICAgICAgICAgICAgIFBFUlNJUyBzdG9rLCBzZWhpbmdnYSBtZWthbmlzbWUgcGVtaWxpaGFuCiAgICAgICAgICAgICAgICAgICAgICAgICAgIGZyYWdtZW50IGJvb3Rsb2FkZXIgaWRlbnRpayBkZW5nYW4gc3RvayAoYm9vdAogICAgICAgICAgICAgICAgICAgICAgICAgICBub3JtYWw6IGZyYWdtZW50IFJFQ09WRVJZIHRpZGFrIGRpbXVhdDsgYm9vdAogICAgICAgICAgICAgICAgICAgICAgICAgICByZWNvdmVyeTogcm9vdGZzIE9yYW5nZUZveCBha3RpZikuCiAgICAgICAgICAgICAgICAgICAgICAgICAgIChGYWxsYmFjazogc3RvayB0YW5wYSBlbnRyaSBSRUNPVkVSWSAtPiBlbnRyaQogICAgICAgICAgICAgICAgICAgICAgICAgICBiYXJ1IHR5cGUtMiBkaXRhbWJhaGthbiBkaSB1cnV0YW4gdGVyYWtoaXIuKQogICAgMy4gRFRCL2NtZGxpbmUgICAgICAgOiBEVEIsIGNtZGxpbmUsIGRhbiBib290Y29uZmlnIGRpc2FsaW4gdmVyYmF0aW0KICAgICAgICAgICAgICAgICAgICAgICAgICAgZGFyaSB2ZW5kb3JfYm9vdCBzdG9rIChub2wgcmlzaWtvIG1pc21hdGNoKS4KCkxheW91dCB2ZW5kb3JfYm9vdCB2NCAoZ3JvdW5kIHRydXRoIG1rYm9vdGltZy5weSBBT1NQL0xpbmVhZ2UsIHRlcnVqaSk6CiAgaGVhZGVyIDIxMjggQjogbWFnaWNAMCAiVk5EUkJPT1QiLCB2ZXJAOCwgcGFnZUAxMiwga2FkZHJAMTYsIHJkYWRkckAyMCwKICAgICAgICAgICAgICAgICB2cl9zaXplQDI0LCBjbWRsaW5lQDI4ICgyMDQ4IEIpLCB0YWdzQDIwNzYsIG5hbWVAMjA4MCAoMTYgQiksCiAgICAgICAgICAgICAgICAgaGRyX3NpemVAMjA5NiwgZHRiX3NpemVAMjEwMCwgZHRiX2FkZHJAMjEwNCAodTY0KSwKICAgICAgICAgICAgICAgICB0Ymxfc2l6ZUAyMTEyLCBlbnRfbnVtQDIxMTYsIGVudF9zaXplQDIxMjAsIGJvb3RjZmdAMjEyNAogIHJlZ2lvbiAgICAgICA6IFtoZWFkZXIgMSBwYWdlXVtyYW1kaXNrOiBlbnRyaSBrb25zZWt1dGlmLCBvZmZzZXQga3VtdWxhdGlmCiAgICAgICAgICAgICAgICAgdGFucGEgcGFkIGFudGFyLWZyYWdtZW50XVtkdGIgcGFnZS1hbGlnbmVkXQogICAgICAgICAgICAgICAgIFt0YWJlbCBwYWdlLWFsaWduZWRdW2Jvb3Rjb25maWcgcGFnZS1hbGlnbmVkXQogIGVudHJpIDEwOCBCICA6IHNpemUgdTMyIHwgb2Zmc2V0IHUzMiB8IHR5cGUgdTMyIHwgbmFtZVszMl0gfCBib2FyZF9pZFsxNl0KICAgICAgICAgICAgICAgICB0eXBlOiAxPVBMQVRGT1JNIDI9UkVDT1ZFUlkgMz1ETEtNCgpQZW1ha2FpYW46CiAgIyBrZW1hcyByZWNvdmVyeSByb290IG1lbmphZGkgY3Bpby5neiBmcmFnbWVudCAoZGV0ZXJtaW5pc3Rpayk6CiAgcHl0aG9uMyBidWlsZF9oeWJyaWRfdmIucHkgcGFjay1yZWNvdmVyeS1yb290IDxkaXJfcmVjb3Zlcnlfcm9vdD4gPG91dC5jcGlvLmd6PgoKICAjIHJha2l0IGltYWdlIGhpYnJpZGE6CiAgcHl0aG9uMyBidWlsZF9oeWJyaWRfdmIucHkgYnVpbGQgLS1zdG9jayA8dmVuZG9yX2Jvb3Rfc3Rvay5pbWc+IFwKICAgICAgKC0tcmVjb3ZlcnktZnJhZ21lbnQgPGZyYWcuY3Bpby5nej4gfCAtLXJlY292ZXJ5LXJvb3QgPGRpcj4pIFwKICAgICAgLS1vdXQgPGh5YnJpZC5pbWc+IFstLWF2YnRvb2wgPGF2YnRvb2wucHk+XSBcCiAgICAgIFstLXBhcnRpdGlvbi1zaXplIE5dIFstLWVudHJ5LW5hbWUgcmVjb3ZlcnldIFstLW5vLXZlcmlmeV0KCiAgIyBpbnNwZWtzaSBpc2kgaW1hZ2U6CiAgcHl0aG9uMyBidWlsZF9oeWJyaWRfdmIucHkgaW5zcGVjdCA8aW1hZ2UuaW1nPgoKU3RkbGliIHNhamEgKGF2YnRvb2wucHkgZGlwYW5nZ2lsIHNlYmFnYWkgc3VicHJvc2VzIGJpbGEgYWRhKS4gUHkgPj0gMy44LgoiIiIKaW1wb3J0IGFyZ3BhcnNlCmltcG9ydCBnemlwCmltcG9ydCBoYXNobGliCmltcG9ydCBpbwppbXBvcnQgb3MKaW1wb3J0IHN0YXQgYXMgc3RhdG1vZAppbXBvcnQgc3RydWN0CmltcG9ydCBzdWJwcm9jZXNzCmltcG9ydCBzeXMKCkVOVFJZX1NJWkUgPSAxMDggICAgICAgICAgIyBWRU5ET1JfUkFNRElTS19UQUJMRV9FTlRSWV9WNF9TSVpFCkJPQVJEX0lEX1NJWkUgPSA2NCAgICAgICAgIyAxNiB4IHUzMiAoa29uc3RhbnRhIG1rYm9vdGltZyBtZW5naGl0dW5nIEVMRU1FTiwgYnVrYW4gYnl0ZSkKSERSX1NJWkVfVjQgPSAyMTI4ClRZUEVfUExBVEZPUk0sIFRZUEVfUkVDT1ZFUlksIFRZUEVfRExLTSA9IDEsIDIsIDMKTkFNQV9USVBFID0gezA6ICJOT05FIiwgMTogIlBMQVRGT1JNIiwgMjogIlJFQ09WRVJZIiwgMzogIkRMS00ifQojIFBlcmtpcmFhbiBydWFuZyBBVkIgKGJsb2IgdmJtZXRhIGhhc2ggKyBwYWRkaW5nKTogNjQgS2lCIHNhbmdhdCBhbWFuLgpBVkJfSEVBRFJPT00gPSAxIDw8IDE2CgoKZGVmIGFsaWduKHgsIHApOgogICAgcmV0dXJuICh4ICsgcCAtIDEpIC8vIHAgKiBwCgoKZGVmIHNoYTI1NihiKToKICAgIHJldHVybiBoYXNobGliLnNoYTI1NihiKS5oZXhkaWdlc3QoKQoKCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KIyBQYXJzZXIgdmVuZG9yX2Jvb3QgdjQgKGxheW91dCBncm91bmQgdHJ1dGgsIGlkZW50aWsgY29tcGFyZV92cmFtZGlzayB2MikKIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQpkZWYgcGFyc2VfdmIocGF0aCk6CiAgICBkYXRhID0gb3BlbihwYXRoLCAicmIiKS5yZWFkKCkKICAgIGlmIGxlbihkYXRhKSA8IDIyMDA6CiAgICAgICAgcmFpc2UgVmFsdWVFcnJvcigidGVybGFsdSBrZWNpbCB1bnR1ayB2ZW5kb3JfYm9vdCAoJWQgQikiICUgbGVuKGRhdGEpKQogICAgaWYgZGF0YVs6OF0gIT0gYiJWTkRSQk9PVCI6CiAgICAgICAgcmFpc2UgVmFsdWVFcnJvcigibWFnaWMgc2FsYWg6ICVyIiAlIGRhdGFbOjhdKQogICAgaCA9IHsiZmlsZSI6IHBhdGgsICJyYXciOiBkYXRhLCAic2l6ZSI6IGxlbihkYXRhKX0KICAgIChoWyJ2ZXIiXSwgaFsicGFnZSJdLCBoWyJrYWRkciJdLCBoWyJyZGFkZHIiXSwKICAgICBoWyJ2cl9zaXplIl0pID0gc3RydWN0LnVucGFja19mcm9tKCI8NUkiLCBkYXRhLCA4KQogICAgaFsiY21kbGluZSJdID0gZGF0YVsyODoyOCArIDIwNDhdLnNwbGl0KGIiXHgwMCIpWzBdLmRlY29kZSgidXRmLTgiLCAicmVwbGFjZSIpCiAgICBoWyJjbWRsaW5lX3JhdyJdID0gZGF0YVsyODoyOCArIDIwNDhdCiAgICBoWyJuYW1lIl0gPSBkYXRhWzIwODA6MjA5Nl0uc3BsaXQoYiJceDAwIilbMF0uZGVjb2RlKCJ1dGYtOCIsICJyZXBsYWNlIikKICAgIGhbImhkcl9zaXplIl0gPSBzdHJ1Y3QudW5wYWNrX2Zyb20oIjxJIiwgZGF0YSwgMjA5NilbMF0KICAgIGhbImR0Yl9zaXplIl0gPSBzdHJ1Y3QudW5wYWNrX2Zyb20oIjxJIiwgZGF0YSwgMjEwMClbMF0KICAgIGhbImR0Yl9hZGRyIl0gPSBzdHJ1Y3QudW5wYWNrX2Zyb20oIjxRIiwgZGF0YSwgMjEwNClbMF0KICAgIGlmIGhbInZlciJdICE9IDQ6CiAgICAgICAgcmFpc2UgVmFsdWVFcnJvcigiaGVhZGVyX3ZlcnNpb249JWQsIHNjcmlwdCBpbmkgYnV0dWggdjQiICUgaFsidmVyIl0pCiAgICBpZiBoWyJoZHJfc2l6ZSJdICE9IEhEUl9TSVpFX1Y0OgogICAgICAgIHJhaXNlIFZhbHVlRXJyb3IoImhlYWRlcl9zaXplPSVkIChoYXJ1c255YSAlZCkiICUgKGhbImhkcl9zaXplIl0sIEhEUl9TSVpFX1Y0KSkKICAgIChoWyJ0Ymxfc2l6ZSJdLCBoWyJlbnRfbnVtIl0sCiAgICAgaFsiZW50X3NpemUiXSwgaFsiYm9vdGNmZ19zaXplIl0pID0gc3RydWN0LnVucGFja19mcm9tKCI8SUlJSSIsIGRhdGEsIDIxMTIpCiAgICBpZiBoWyJlbnRfc2l6ZSJdICE9IEVOVFJZX1NJWkU6CiAgICAgICAgcmFpc2UgVmFsdWVFcnJvcigiZW50X3NpemU9JWQgKGhhcnVzbnlhICVkKSIgJSAoaFsiZW50X3NpemUiXSwgRU5UUllfU0laRSkpCiAgICBpZiBoWyJ0Ymxfc2l6ZSJdICE9IGhbImVudF9udW0iXSAqIGhbImVudF9zaXplIl06CiAgICAgICAgcmFpc2UgVmFsdWVFcnJvcigidGJsX3NpemUgJWQgIT0gZW50X251bSplbnRfc2l6ZSAlZCIgJQogICAgICAgICAgICAgICAgICAgICAgICAgKGhbInRibF9zaXplIl0sIGhbImVudF9udW0iXSAqIGhbImVudF9zaXplIl0pKQogICAgcGFnZSA9IGhbInBhZ2UiXQoKICAgICMgLS0tLSBsb2thc2kgcmVnaW9uICh1cnV0YW4gcmVzbWkgbWtib290aW1nOiBibG9iIC0+IGR0YiAtPiB0YWJlbCAtPiBib290Y29uZmlnKQogICAgaFsiYmxvYl9vZmYiXSA9IHBhZ2UKICAgIGhbImR0Yl9vZmYiXSA9IHBhZ2UgKyBhbGlnbihoWyJ2cl9zaXplIl0sIHBhZ2UpCiAgICBoWyJ0Ymxfb2ZmIl0gPSBoWyJkdGJfb2ZmIl0gKyAoYWxpZ24oaFsiZHRiX3NpemUiXSwgcGFnZSkgaWYgaFsiZHRiX3NpemUiXSBlbHNlIDApCiAgICBoWyJib290Y2ZnX29mZiJdID0gaFsidGJsX29mZiJdICsgYWxpZ24oaFsidGJsX3NpemUiXSwgcGFnZSkKCiAgICAjIHNhbml0eTogcmVnaW9uIGhhcnVzIG1hc3VrIGRhbGFtIGZpbGUgKGRlbmdhbiBhdGF1IHRhbnBhIGZvb3RlciBBVkIpCiAgICBha2hpciA9IGhbImJvb3RjZmdfb2ZmIl0gKyBoWyJib290Y2ZnX3NpemUiXQogICAgaWYgYWtoaXIgPiBsZW4oZGF0YSk6CiAgICAgICAgcmFpc2UgVmFsdWVFcnJvcigibGF5b3V0IHJlZ2lvbiBtZWxld2F0aSB1anVuZyBmaWxlIChha2hpcj0lZCwgZmlsZT0lZCkgIgogICAgICAgICAgICAgICAgICAgICAgICAgIuKAlCBpbWFnZSBidWthbiBoYXNpbCBta2Jvb3RpbWcgc3RhbmRhciIgJSAoYWtoaXIsIGxlbihkYXRhKSkpCiAgICBoWyJjb250ZW50X2VuZCJdID0gYWtoaXIKCiAgICAjIC0tLS0gZW50cmkgdGFiZWwKICAgIGhbImVudHJpZXMiXSA9IFtdCiAgICBmb3IgaSBpbiByYW5nZShoWyJlbnRfbnVtIl0pOgogICAgICAgIGUgPSBoWyJ0Ymxfb2ZmIl0gKyBpICogRU5UUllfU0laRQogICAgICAgIHJzaXplLCByb2ZmLCBydHlwZSA9IHN0cnVjdC51bnBhY2tfZnJvbSgiPElJSSIsIGRhdGEsIGUpCiAgICAgICAgcm5hbWUgPSBkYXRhW2UgKyAxMjplICsgNDRdLnNwbGl0KGIiXHgwMCIpWzBdLmRlY29kZSgidXRmLTgiLCAicmVwbGFjZSIpCiAgICAgICAgYmxvYiA9IGRhdGFbcGFnZSArIHJvZmY6IHBhZ2UgKyByb2ZmICsgcnNpemVdCiAgICAgICAgaFsiZW50cmllcyJdLmFwcGVuZCh7CiAgICAgICAgICAgICJpZHgiOiBpLCAic2l6ZSI6IHJzaXplLCAib2ZmIjogcm9mZiwgInR5cGUiOiBydHlwZSwgIm5hbWUiOiBybmFtZSwKICAgICAgICAgICAgImJvYXJkX2lkIjogZGF0YVtlICsgNDQ6ZSArIDQ0ICsgQk9BUkRfSURfU0laRV0sCiAgICAgICAgICAgICJzaGEiOiBzaGEyNTYoYmxvYiksICJibG9iIjogYmxvYiwKICAgICAgICB9KQoKICAgICMgLS0tLSByZWdpb24gZHRiICYgYm9vdGNvbmZpZyAoYnl0ZSBtZW50YWgpCiAgICBoWyJkdGIiXSA9IChkYXRhW2hbImR0Yl9vZmYiXTpoWyJkdGJfb2ZmIl0gKyBoWyJkdGJfc2l6ZSJdXQogICAgICAgICAgICAgICAgaWYgaFsiZHRiX3NpemUiXSBlbHNlIGIiIikKICAgIGhbImJvb3RjZmciXSA9IChkYXRhW2hbImJvb3RjZmdfb2ZmIl06aFsiYm9vdGNmZ19vZmYiXSArIGhbImJvb3RjZmdfc2l6ZSJdXQogICAgICAgICAgICAgICAgICAgIGlmIGhbImJvb3RjZmdfc2l6ZSJdIGVsc2UgYiIiKQogICAgIyBHcm91bmQgdHJ1dGggc3RvayBtYWxhY2hpdGU6IGJsb2IgRFRCIE1USyBiZXJhd2FsYW4gNjQtYnl0ZSBwcmVhbWJsZQogICAgIyBTRUJFTFVNIG1hZ2ljIGQwMGRmZWVkIC0+IG1hZ2ljIGRpY2FyaSBkaSBkYWxhbSByZWdpb24sIGJ1a2FuIGRpIG9mZnNldCAwLgogICAgaFsiZHRiX21hZ2ljX29rIl0gPSAoYiJceGQwXHgwZFx4ZmVceGVkIiBpbiBoWyJkdGIiXVs6NDA5Nl0pIGlmIGhbImR0YiJdIGVsc2UgTm9uZQoKICAgICMgLS0tLSBmb290ZXIgQVZCIChvcHNpb25hbCkKICAgIGZvb3QgPSBkYXRhWy02NDpdCiAgICBoWyJhdmIiXSA9IE5vbmUKICAgIGlmIGZvb3RbOjRdID09IGIiQVZCZiI6CiAgICAgICAgaFsiYXZiIl0gPSBzdHJ1Y3QudW5wYWNrX2Zyb20oIj40c0lJUVFRIiwgZm9vdCwgMCkKICAgIHJldHVybiBoCgoKIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQojIFBhY2tlciBjcGlvIG5ld2MgZGV0ZXJtaW5pc3RpayBkYXJpIHNlYnVhaCBkaXJlY3RvcnkgKHJlY292ZXJ5IHJvb3QpCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KZGVmIF9oZHIoaW5vLCBtb2RlLCBmaWxlc2l6ZSwgbmFtZXNpemUpOgogICAgcmV0dXJuIGIiMDcwNzAxIiArIGIiIi5qb2luKAogICAgICAgIGIiJTA4WCIgJSBmIGZvciBmIGluCiAgICAgICAgKGlubywgbW9kZSwgMCwgMCwgMSwgMCwgZmlsZXNpemUsIDAsIDAsIDAsIDAsIG5hbWVzaXplLCAwKSkKCgpkZWYgX3BhZDQob3V0KToKICAgIHdoaWxlIG91dC50ZWxsKCkgJSA0OgogICAgICAgIG91dC53cml0ZShiIlx4MDAiKQoKCmRlZiBwYWNrX2NwaW9fYnl0ZXMocm9vdCk6CiAgICAiIiJLZW1iYWxpa2FuIGNwaW8gbmV3YyAoYmVsdW0gZGlrb21wcmVzKSBkYXJpIGlzaSBgcm9vdGAuCiAgICBEZXRlcm1pbmlzdGlrOiB1cnV0YW4gc29ydGVkLCBtdGltZT0wLCB1aWQvZ2lkPTAuIiIiCiAgICBvdXQgPSBpby5CeXRlc0lPKCkKICAgICMgb3Mud2FsayAoZm9sbG93bGlua3M9RmFsc2UpOiBzeW1saW5rLWtlLWRpcmVrdG9yaSBtdW5jdWwgZGkgYGRpcnNgCiAgICAjIHRldGFwaSBUSURBSyBkaXRlbHVzdXJpIOKAlCBjZWsgaXNsaW5rKCkgZHVsdSBhZ2FyIG1hc3VrIHNlYmFnYWkgZW50cmkgbGluay4KICAgIGNsZWFuID0gW10KICAgIGZvciBiYXNlLCBkaXJzLCBmaWxlcyBpbiBvcy53YWxrKHJvb3QpOgogICAgICAgIGZvciBuIGluIHNvcnRlZChkaXJzICsgZmlsZXMpOgogICAgICAgICAgICBwID0gb3MucGF0aC5qb2luKGJhc2UsIG4pCiAgICAgICAgICAgIGlmIG9zLnBhdGguaXNsaW5rKHApOgogICAgICAgICAgICAgICAgY2xlYW4uYXBwZW5kKCgibGluayIsIHApKQogICAgICAgICAgICBlbGlmIG9zLnBhdGguaXNkaXIocCk6CiAgICAgICAgICAgICAgICBjbGVhbi5hcHBlbmQoKCJkaXIiLCBwKSkKICAgICAgICAgICAgZWxzZToKICAgICAgICAgICAgICAgIGNsZWFuLmFwcGVuZCgoImZpbGUiLCBwKSkKICAgIGlubyA9IDEKICAgIGZvciBraW5kLCBwIGluIGNsZWFuOgogICAgICAgIHJlbCA9IG9zLnBhdGgucmVscGF0aChwLCByb290KS5yZXBsYWNlKG9zLnNlcCwgIi8iKQogICAgICAgIG5iID0gcmVsLmVuY29kZSgpICsgYiJceDAwIgogICAgICAgIHN0ID0gb3MubHN0YXQocCkKICAgICAgICBpZiBraW5kID09ICJkaXIiOgogICAgICAgICAgICBtb2RlID0gMG80MDc1NQogICAgICAgICAgICBkYXRhID0gYiIiCiAgICAgICAgZWxpZiBraW5kID09ICJsaW5rIjoKICAgICAgICAgICAgbW9kZSA9IDBvMTIwNzc3CiAgICAgICAgICAgIGRhdGEgPSBvcy5yZWFkbGluayhwKS5lbmNvZGUoKQogICAgICAgIGVsc2U6CiAgICAgICAgICAgIG1vZGUgPSAwbzEwMDc1NSBpZiBzdC5zdF9tb2RlICYgMG8xMTEgZWxzZSAwbzEwMDY0NAogICAgICAgICAgICB3aXRoIG9wZW4ocCwgInJiIikgYXMgZjoKICAgICAgICAgICAgICAgIGRhdGEgPSBmLnJlYWQoKQogICAgICAgIG91dC53cml0ZShfaGRyKGlubywgbW9kZSwgbGVuKGRhdGEpLCBsZW4obmIpKSkKICAgICAgICBvdXQud3JpdGUobmIpCiAgICAgICAgX3BhZDQob3V0KQogICAgICAgIG91dC53cml0ZShkYXRhKQogICAgICAgIF9wYWQ0KG91dCkKICAgICAgICBpbm8gKz0gMQogICAgbmIgPSBiIlRSQUlMRVIhISFceDAwIgogICAgb3V0LndyaXRlKF9oZHIoMCwgMCwgMCwgbGVuKG5iKSkpCiAgICBvdXQud3JpdGUobmIpCiAgICBfcGFkNChvdXQpCiAgICByZXR1cm4gb3V0LmdldHZhbHVlKCkKCgpkZWYgcGFja19yZWNvdmVyeV9yb290KHJvb3QsIG91dF9wYXRoKToKICAgIHJvb3QgPSBvcy5wYXRoLmFic3BhdGgocm9vdCkKICAgIGlmIG5vdCBvcy5wYXRoLmlzZGlyKHJvb3QpOgogICAgICAgIHJhaXNlIFN5c3RlbUV4aXQoIlshXSByZWNvdmVyeSByb290IGJ1a2FuIGRpcmVjdG9yeTogJXMiICUgcm9vdCkKICAgIGNwaW8gPSBwYWNrX2NwaW9fYnl0ZXMocm9vdCkKICAgIHdpdGggb3BlbihvdXRfcGF0aCwgIndiIikgYXMgZjoKICAgICAgICBmLndyaXRlKGd6aXAuY29tcHJlc3MoY3BpbywgOSwgbXRpbWU9MCkpCiAgICBuX2ZpbGVzID0gc3VtKDEgZm9yIF8sIHAgaW4gX3dhbGtfcGFpcnMocm9vdCkgaWYgX2tpbmQocCkgIT0gImRpciIpCiAgICBwcmludCgiWytdIGNwaW8uZ3ogcmVjb3ZlcnkgOiAlcyAoJWQgZW50cmksIGNwaW8gJXMgQiAtPiBneiAlcyBCKSIgJQogICAgICAgICAgKG91dF9wYXRoLCBuX2ZpbGVzLCBmb3JtYXQobGVuKGNwaW8pLCAiLCIpLAogICAgICAgICAgIGZvcm1hdChvcy5wYXRoLmdldHNpemUob3V0X3BhdGgpLCAiLCIpKSkKICAgIHJldHVybiBvdXRfcGF0aAoKCmRlZiBfa2luZChwKToKICAgIGlmIG9zLnBhdGguaXNsaW5rKHApOgogICAgICAgIHJldHVybiAibGluayIKICAgIHJldHVybiAiZGlyIiBpZiBvcy5wYXRoLmlzZGlyKHApIGVsc2UgImZpbGUiCgoKZGVmIF93YWxrX3BhaXJzKHJvb3QpOgogICAgZm9yIGJhc2UsIGRpcnMsIGZpbGVzIGluIG9zLndhbGsocm9vdCk6CiAgICAgICAgZm9yIG4gaW4gc29ydGVkKGRpcnMgKyBmaWxlcyk6CiAgICAgICAgICAgIHAgPSBvcy5wYXRoLmpvaW4oYmFzZSwgbikKICAgICAgICAgICAgeWllbGQgYmFzZSwgcAoKCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KIyBBc3NlbWJsZXIgaGlicmlkYQojIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCmRlZiBhc3NlbWJsZShzdG9ja19wYXRoLCBmcmFnX3BhdGgsIG91dF9wYXRoLCBlbnRyeV9uYW1lPSJyZWNvdmVyeSIsCiAgICAgICAgICAgICBwYXJ0aXRpb25fc2l6ZT1Ob25lKToKICAgICIiIlJha2l0IHZlbmRvcl9ib290IGhpYnJpZGEuCgogICAgTW9kZSB1dGFtYSAoUkVQTEFDRSkg4oCUIHN0b2sgbWFsYWNoaXRlIHB1bnlhIGVudHJpIGJlcnRpcGUgUkVDT1ZFUlkKICAgIChncm91bmQgdHJ1dGg6IFBMQVRGT1JNIHRhbnBhLW5hbWEgKyAncmVjb3ZlcnknIHR5cGUtMik6CiAgICAgICogUExBVEZPUk0gZGFuIGVudHJpIGxhaW4gICAgIDogYmxvYiB2ZXJiYXRpbSBzdG9rCiAgICAgICogZW50cmkgUkVDT1ZFUlkgc3RvayAgICAgICAgIDogYmxvYiBESUdBTlRJIHJvb3RmcyBPcmFuZ2VGb3gsIGRlbmdhbgogICAgICAgIG5hbWUvdHlwZS9ib2FyZF9pZCBQRVJTSVMgc3RvayAobWVrYW5pc21lIGJvb3Rsb2FkZXIgaWRlbnRpayBzdG9rKQogICAgTW9kZSBjYWRhbmdhbiAoQVBQRU5EKSDigJQgYmlsYSBzdG9rIHRhbnBhIGVudHJpIFJFQ09WRVJZOiBlbnRyaSBiYXJ1CiAgICB0eXBlLTIgZGl0YW1iYWhrYW4gZGkgdXJ1dGFuIFRFUkFLSElSLgogICAgIiIiCiAgICBzdG9rID0gcGFyc2VfdmIoc3RvY2tfcGF0aCkKICAgIGZyYWcgPSBvcGVuKGZyYWdfcGF0aCwgInJiIikucmVhZCgpCiAgICBwYWdlID0gc3Rva1sicGFnZSJdCgogICAgZW50cmkgPSBzdG9rWyJlbnRyaWVzIl0KICAgIHRvdGFsX3N0b2sgPSBzdW0oZVsic2l6ZSJdIGZvciBlIGluIGVudHJpKQogICAgaWYgdG90YWxfc3RvayAhPSBzdG9rWyJ2cl9zaXplIl06CiAgICAgICAgcmFpc2UgU3lzdGVtRXhpdCgKICAgICAgICAgICAgIlshXSB0b3RhbCBlbnRyaSBzdG9rICVkICE9IHZyX3NpemUgJWQgKGFkYSBwYWRkaW5nIGFudGFyLWVudHJpICIKICAgICAgICAgICAgIm5vbi1zdGFuZGFyKSDigJQgYXNzZW1ibGVyIHRpZGFrIGJlcmFuaSBtZW5lYmFrLCBzdG9wLiIKICAgICAgICAgICAgJSAodG90YWxfc3Rvaywgc3Rva1sidnJfc2l6ZSJdKSkKCiAgICBpZHhfcmVjID0gbmV4dCgoaSBmb3IgaSwgZSBpbiBlbnVtZXJhdGUoZW50cmkpCiAgICAgICAgICAgICAgICAgICAgaWYgZVsidHlwZSJdID09IFRZUEVfUkVDT1ZFUlkgb3IgZVsibmFtZSJdID09IGVudHJ5X25hbWUpLCBOb25lKQogICAgZ2FudGkgPSBpZHhfcmVjIGlzIG5vdCBOb25lCiAgICBpZiBub3QgZ2FudGkgYW5kIGFueShlWyJuYW1lIl0gPT0gZW50cnlfbmFtZSBmb3IgZSBpbiBlbnRyaSk6CiAgICAgICAgcmFpc2UgU3lzdGVtRXhpdCgiWyFdIHN0b2sgdGFucGEgZW50cmkgUkVDT1ZFUlksIHRldGFwaSBuYW1hICclcycgIgogICAgICAgICAgICAgICAgICAgICAgICAgInN1ZGFoIGRpcGFrYWkgZW50cmkgbGFpbiIgJSBlbnRyeV9uYW1lKQoKICAgICMgLS0tLSBzdXN1biBzbG90IGVudHJpOiAobmFtZSwgdHlwZSwgYm9hcmRfaWQsIGJsb2IpCiAgICBzbG90cyA9IFtdCiAgICBmb3IgaSwgZSBpbiBlbnVtZXJhdGUoZW50cmkpOgogICAgICAgIGJsb2IgPSBzdG9rWyJyYXciXVtwYWdlICsgZVsib2ZmIl06IHBhZ2UgKyBlWyJvZmYiXSArIGVbInNpemUiXV0KICAgICAgICBpZiBnYW50aSBhbmQgaSA9PSBpZHhfcmVjOgogICAgICAgICAgICBibG9iID0gZnJhZyAgIyBTQVRVLVNBVFVOWUEgYnl0ZSB5YW5nIGJlcnViYWggaXNpCiAgICAgICAgc2xvdHMuYXBwZW5kKHsibmFtZSI6IGVbIm5hbWUiXSwgInR5cGUiOiBlWyJ0eXBlIl0sCiAgICAgICAgICAgICAgICAgICAgICAiYm9hcmRfaWQiOiBlWyJib2FyZF9pZCJdLCAiYmxvYiI6IGJsb2J9KQogICAgaWYgbm90IGdhbnRpOgogICAgICAgIHNsb3RzLmFwcGVuZCh7Im5hbWUiOiBlbnRyeV9uYW1lLCAidHlwZSI6IFRZUEVfUkVDT1ZFUlksCiAgICAgICAgICAgICAgICAgICAgICAiYm9hcmRfaWQiOiBiIlx4MDAiICogQk9BUkRfSURfU0laRSwgImJsb2IiOiBmcmFnfSkKCiAgICAjIC0tLS0gcmFraXQgdWxhbmc6IGhlYWRlciArIGJsb2IgKyBkdGIgKyB0YWJlbCArIGJvb3Rjb25maWcKICAgIGhkciA9IGJ5dGVhcnJheShzdG9rWyJyYXciXVs6cGFnZV0pCiAgICBibG9iX3JlZ2lvbiA9IGIiIi5qb2luKHNbImJsb2IiXSBmb3IgcyBpbiBzbG90cykKICAgIHZyX25ldyA9IGxlbihibG9iX3JlZ2lvbikKICAgIHRhYmxlID0gYiIiCiAgICBvZmYgPSAwCiAgICBmb3IgcyBpbiBzbG90czoKICAgICAgICB0YWJsZSArPSAoc3RydWN0LnBhY2soIjxJSUkiLCBsZW4oc1siYmxvYiJdKSwgb2ZmLCBzWyJ0eXBlIl0pICsKICAgICAgICAgICAgICAgICAgc1sibmFtZSJdLmVuY29kZSgpLmxqdXN0KDMyLCBiIlx4MDAiKSArIHNbImJvYXJkX2lkIl0pCiAgICAgICAgb2ZmICs9IGxlbihzWyJibG9iIl0pCiAgICBzdHJ1Y3QucGFja19pbnRvKCI8SSIsIGhkciwgMjQsIHZyX25ldykKICAgIHN0cnVjdC5wYWNrX2ludG8oIjxJIiwgaGRyLCAyMTEyLCBsZW4odGFibGUpKQogICAgc3RydWN0LnBhY2tfaW50bygiPEkiLCBoZHIsIDIxMTYsIGxlbihzbG90cykpCgogICAgb3V0ID0gaW8uQnl0ZXNJTygpCiAgICBvdXQud3JpdGUoaGRyKSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIyBoZWFkZXIgKDEgcGFnZSkKICAgIG91dC53cml0ZShibG9iX3JlZ2lvbikgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAjIGJsb2Igc3RvayArIGZyYWcgT0YKICAgIF9maWxsKG91dCwgYWxpZ24ob3V0LnRlbGwoKSwgcGFnZSkgLSBvdXQudGVsbCgpKSAgICAgICAgICAjIHBhZCBwYWdlCiAgICBvdXQud3JpdGUoc3Rva1siZHRiIl0pICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIyBkdGIgc3RvayB2ZXJiYXRpbQogICAgX2ZpbGwob3V0LCBhbGlnbihvdXQudGVsbCgpLCBwYWdlKSAtIG91dC50ZWxsKCkpCiAgICBvdXQud3JpdGUodGFibGUpICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIyB0YWJlbCBlbnRyaS1wZXItZW50cmkKICAgIF9maWxsKG91dCwgYWxpZ24ob3V0LnRlbGwoKSwgcGFnZSkgLSBvdXQudGVsbCgpKQogICAgb3V0LndyaXRlKHN0b2tbImJvb3RjZmciXSkgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICMgYm9vdGNvbmZpZyBzdG9rIHZlcmJhdGltCiAgICBfZmlsbChvdXQsIGFsaWduKG91dC50ZWxsKCksIHBhZ2UpIC0gb3V0LnRlbGwoKSkKICAgIGNvbnRlbnQgPSBvdXQuZ2V0dmFsdWUoKQogICAgY29udGVudF9lbmQgPSBsZW4oY29udGVudCkKCiAgICBwc2l6ZSA9IHBhcnRpdGlvbl9zaXplIG9yIHN0b2tbInNpemUiXQogICAgaWYgcHNpemUgIT0gc3Rva1sic2l6ZSJdIGFuZCBwc2l6ZSA8IHN0b2tbInNpemUiXToKICAgICAgICByYWlzZSBTeXN0ZW1FeGl0KCJbIV0gcGFydGl0aW9uLXNpemUgJWQgbGViaWgga2VjaWwgZGFyaSBpbWFnZSBzdG9rICVkIiAlCiAgICAgICAgICAgICAgICAgICAgICAgICAocHNpemUsIHN0b2tbInNpemUiXSkpCiAgICBpZiBjb250ZW50X2VuZCArIEFWQl9IRUFEUk9PTSA+IHBzaXplOgogICAgICAgIHJhaXNlIFN5c3RlbUV4aXQoCiAgICAgICAgICAgICJbIV0ga29udGVuIGhpYnJpZGEgJXMgQiArIGhlYWRyb29tIEFWQiBtZWxlYmloaSBwYXJ0aXRpb24tc2l6ZSAlcyBCLlxuIgogICAgICAgICAgICAiICAgIChibG9iICVzIEIgKyBmcmFnbWVudCAlcyBCKS4gRnJhZ21lbnQgcmVjb3ZlcnkgdGVybGFsdSBiZXNhclxuIgogICAgICAgICAgICAiICAgIHV0ayB2ZW5kb3JfYm9vdCA2NCBNaUIg4oCUIHBlcmtlY2lsIHJvb3RmcyBhdGF1IHBlcmJlc2FyIHBhcnRpc2kuIgogICAgICAgICAgICAlIChmb3JtYXQoY29udGVudF9lbmQsICIsIiksIGZvcm1hdChwc2l6ZSwgIiwiKSwKICAgICAgICAgICAgICAgZm9ybWF0KHZyX25ldywgIiwiKSwgZm9ybWF0KGxlbihmcmFnKSwgIiwiKSkpCgogICAgd2l0aCBvcGVuKG91dF9wYXRoLCAid2IiKSBhcyBmOgogICAgICAgIGYud3JpdGUoY29udGVudCkKCiAgICBpbmZvID0gewogICAgICAgICJzdG9rIjogc3RvaywgImZyYWciOiBmcmFnLCAidnJfbmV3IjogdnJfbmV3LCAiY29udGVudF9lbmQiOiBjb250ZW50X2VuZCwKICAgICAgICAicHNpemUiOiBwc2l6ZSwgIm91dCI6IG91dF9wYXRoLCAiZ2FudGkiOiBnYW50aSwgImlkeF9yZWMiOiBpZHhfcmVjLAogICAgICAgICJzbG90cyI6IHNsb3RzLCAiZW50cmllc19uZXciOiBsZW4oc2xvdHMpLAogICAgfQogICAgcmV0dXJuIGluZm8KCgpkZWYgX2ZpbGwoZiwgbik6CiAgICBpZiBuID4gMDoKICAgICAgICBmLndyaXRlKGIiXHgwMCIgKiBuKQoKCmRlZiBhZGRfYXZiX2Zvb3RlcihvdXRfcGF0aCwgcHNpemUsIGF2YnRvb2wpOgogICAgaWYgbm90IGF2YnRvb2w6CiAgICAgICAgY2FuZCA9IFsiYXZidG9vbC5weSIsIG9zLnBhdGguam9pbihvcy5wYXRoLmRpcm5hbWUob3MucGF0aC5hYnNwYXRoKF9fZmlsZV9fKSksCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAiYXZidG9vbC5weSIpXQogICAgICAgIGF2YnRvb2wgPSBuZXh0KChjIGZvciBjIGluIGNhbmQgaWYgb3MucGF0aC5pc2ZpbGUoYykpLCBOb25lKQogICAgICAgIGlmIG5vdCBhdmJ0b29sOgogICAgICAgICAgICByYWlzZSBTeXN0ZW1FeGl0KCJbIV0gYXZidG9vbC5weSB0aWRhayBkaXRlbXVrYW4gIgogICAgICAgICAgICAgICAgICAgICAgICAgICAgICIocGFrYWkgLS1hdmJ0b29sIC9wYXRoL2F2YnRvb2wucHkpIikKICAgIGNtZCA9IFtzeXMuZXhlY3V0YWJsZSwgYXZidG9vbCwgImFkZF9oYXNoX2Zvb3RlciIsCiAgICAgICAgICAgIi0taW1hZ2UiLCBvdXRfcGF0aCwgIi0tcGFydGl0aW9uX25hbWUiLCAidmVuZG9yX2Jvb3QiLAogICAgICAgICAgICItLXBhcnRpdGlvbl9zaXplIiwgc3RyKHBzaXplKSwgIi0tYWxnb3JpdGhtIiwgIk5PTkUiLAogICAgICAgICAgICMgc2FsdCB0ZXRhcCAtPiBidWlsZCByZXByb2R1c2liZWwgKHNoYTI1NiBhbnRhci1ydW4gYmlzYSBkaWJhbmRpbmcpCiAgICAgICAgICAgIi0tc2FsdCIsICIwMCIgKiAzMl0KICAgIHIgPSBzdWJwcm9jZXNzLnJ1bihjbWQsIGNhcHR1cmVfb3V0cHV0PVRydWUsIHRleHQ9VHJ1ZSkKICAgIGlmIHIucmV0dXJuY29kZSAhPSAwOgogICAgICAgIHJhaXNlIFN5c3RlbUV4aXQoIlshXSBhdmJ0b29sIGFkZF9oYXNoX2Zvb3RlciBnYWdhbDpcbiVzJXMiICUKICAgICAgICAgICAgICAgICAgICAgICAgIChyLnN0ZG91dCwgci5zdGRlcnIpKQogICAgcmV0dXJuIGNtZAoKCmRlZiB2ZXJpZnlfYXZiKG91dF9wYXRoLCBhdmJ0b29sKToKICAgIGNtZCA9IFtzeXMuZXhlY3V0YWJsZSwgYXZidG9vbCwgInZlcmlmeV9pbWFnZSIsICItLWltYWdlIiwgb3V0X3BhdGhdCiAgICByID0gc3VicHJvY2Vzcy5ydW4oY21kLCBjYXB0dXJlX291dHB1dD1UcnVlLCB0ZXh0PVRydWUpCiAgICByZXR1cm4gci5yZXR1cm5jb2RlID09IDAsIChyLnN0ZG91dCArIHIuc3RkZXJyKS5zdHJpcCgpCgoKIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQojIFNlbGYtdmVyaWZpa2FzaTogcmUtcGFyc2UgaGFzaWwgZGFuIGJhbmRpbmdrYW4gYnl0ZS1wZXItYnl0ZSBkZW5nYW4gc3RvawojIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCmRlZiBzZWxmY2hlY2soaW5mbywgZW50cnlfbmFtZT0icmVjb3ZlcnkiKToKICAgIHN0b2ssIG91dF9wYXRoID0gaW5mb1sic3RvayJdLCBpbmZvWyJvdXQiXQogICAgYmFydSA9IHBhcnNlX3ZiKG91dF9wYXRoKQogICAgZXJyID0gW10KICAgIG5fY2VrID0gWzBdCiAgICBnYW50aSwgaWR4X3JlYyA9IGluZm9bImdhbnRpIl0sIGluZm9bImlkeF9yZWMiXQoKICAgIGRlZiBjZWsoa29uZGlzaSwgcGVzYW4pOgogICAgICAgIG5fY2VrWzBdICs9IDEKICAgICAgICBpZiBub3Qga29uZGlzaToKICAgICAgICAgICAgZXJyLmFwcGVuZChwZXNhbikKCiAgICBjZWsoYmFydVsidmVyIl0gPT0gNCBhbmQgYmFydVsiaGRyX3NpemUiXSA9PSBIRFJfU0laRV9WNCwgImhlYWRlciB2NC8yMTI4IGJlcnViYWgiKQogICAgY2VrKGJhcnVbInBhZ2UiXSA9PSBzdG9rWyJwYWdlIl0sICJwYWdlIHNpemUgYmVydWJhaCIpCiAgICBjZWsoYmFydVsiY21kbGluZV9yYXciXSA9PSBzdG9rWyJjbWRsaW5lX3JhdyJdLCAiY21kbGluZSBiZXJ1YmFoIikKICAgIGNlayhiYXJ1WyJkdGIiXSA9PSBzdG9rWyJkdGIiXSwgImJ5dGUgRFRCIGJlcnViYWgiKQogICAgY2VrKGJhcnVbImJvb3RjZmciXSA9PSBzdG9rWyJib290Y2ZnIl0sICJieXRlIGJvb3Rjb25maWcgYmVydWJhaCIpCiAgICBuX2hhcmFwID0gc3Rva1siZW50X251bSJdICsgKDAgaWYgZ2FudGkgZWxzZSAxKQogICAgY2VrKGxlbihiYXJ1WyJlbnRyaWVzIl0pID09IG5faGFyYXAsCiAgICAgICAgImp1bWxhaCBlbnRyaSAlZCAhPSAlZCIgJSAobGVuKGJhcnVbImVudHJpZXMiXSksIG5faGFyYXApKQogICAgY2VrKGJhcnVbImR0Yl9tYWdpY19vayJdIGlzIG5vdCBGYWxzZSwgIm1hZ2ljIERUQiBoaWxhbmcgZGkgaGFzaWwiKQogICAgIyBzZXRpYXAgc2xvdDogZW50cmkgbm9uLXJlY292ZXJ5IHZlcmJhdGltIHN0b2s7IGVudHJpIHJlY292ZXJ5ID0gZnJhZyBPRgogICAgcmVjX3Nsb3QgPSBpZHhfcmVjIGlmIGdhbnRpIGVsc2UgbGVuKHN0b2tbImVudHJpZXMiXSkKICAgIGZvciBpLCBzIGluIGVudW1lcmF0ZShpbmZvWyJzbG90cyJdKToKICAgICAgICBiID0gYmFydVsiZW50cmllcyJdW2ldCiAgICAgICAgY2VrKChiWyJuYW1lIl0sIGJbInR5cGUiXSwgYlsiYm9hcmRfaWQiXSkgPT0KICAgICAgICAgICAgKHNbIm5hbWUiXSwgc1sidHlwZSJdLCBzWyJib2FyZF9pZCJdKSwKICAgICAgICAgICAgImVudHJpIFslZF0gKG5hbWUvdHlwZS9ib2FyZF9pZCkgYmVydWJhaCIgJSBpKQogICAgICAgIGNlayhiWyJzaGEiXSA9PSBzaGEyNTYoc1siYmxvYiJdKSwgImlzaSBibG9iIFslZF0gdGlkYWsgY29jb2siICUgaSkKICAgICAgICBpZiBpID09IHJlY19zbG90OgogICAgICAgICAgICBjZWsoYlsidHlwZSJdID09IFRZUEVfUkVDT1ZFUlkgYW5kIGJbInNoYSJdID09IHNoYTI1NihpbmZvWyJmcmFnIl0pLAogICAgICAgICAgICAgICAgImVudHJpIHJlY292ZXJ5IHRpZGFrIGJlcmlzaSBmcmFnbWVudCBPcmFuZ2VGb3giKQogICAgICAgICAgICBpZiBnYW50aToKICAgICAgICAgICAgICAgIHNlID0gc3Rva1siZW50cmllcyJdW2lkeF9yZWNdCiAgICAgICAgICAgICAgICBjZWsoKGJbIm5hbWUiXSwgYlsidHlwZSJdLCBiWyJib2FyZF9pZCJdKSA9PQogICAgICAgICAgICAgICAgICAgIChzZVsibmFtZSJdLCBzZVsidHlwZSJdLCBzZVsiYm9hcmRfaWQiXSksCiAgICAgICAgICAgICAgICAgICAgImF0cmlidXQgZW50cmkgcmVjb3Zlcnkgc3RvayBiZXJ1YmFoIikKICAgICAgICBlbHNlOgogICAgICAgICAgICBhc2xpID0gc3Rva1siZW50cmllcyJdW2ldICAjIHNsb3Qgbm9uLXJlY292ZXJ5IHNlbGFsdSAxOjEgZGduIHN0b2sKICAgICAgICAgICAgY2VrKGJbInNoYSJdID09IGFzbGlbInNoYSJdLCAiYmxvYiBzdG9rIFslZF0gYmVydWJhaCEiICUgaSkKICAgICAgICAgICAgY2VrKChiWyJuYW1lIl0sIGJbInR5cGUiXSwgYlsiYm9hcmRfaWQiXSkgPT0KICAgICAgICAgICAgICAgIChhc2xpWyJuYW1lIl0sIGFzbGlbInR5cGUiXSwgYXNsaVsiYm9hcmRfaWQiXSksCiAgICAgICAgICAgICAgICAiYXRyaWJ1dCBzdG9rIFslZF0gYmVydWJhaCIgJSBpKQogICAgIyBvZmZzZXQga3VtdWxhdGlmICsga29uc2lzdGVuc2kgaGVhZGVyCiAgICBvZmYgPSAwCiAgICBmb3IgaSwgZSBpbiBlbnVtZXJhdGUoYmFydVsiZW50cmllcyJdKToKICAgICAgICBjZWsoZVsib2ZmIl0gPT0gb2ZmLCAib2Zmc2V0IGVudHJpIFslZF0gc2FsYWgiICUgaSkKICAgICAgICBvZmYgKz0gZVsic2l6ZSJdCiAgICBjZWsoYmFydVsidnJfc2l6ZSJdID09IGluZm9bInZyX25ldyJdLCAidnJfc2l6ZSBzYWxhaCIpCiAgICBjZWsoc3VtKGVbInNpemUiXSBmb3IgZSBpbiBiYXJ1WyJlbnRyaWVzIl0pID09IGJhcnVbInZyX3NpemUiXSwKICAgICAgICAidG90YWwgZW50cmkgIT0gdnJfc2l6ZSIpCiAgICBjZWsoYmFydVsidGJsX3NpemUiXSA9PSBsZW4oYmFydVsiZW50cmllcyJdKSAqIEVOVFJZX1NJWkUsICJ0Ymxfc2l6ZSBzYWxhaCIpCiAgICBjZWsoYmFydVsiZW50X251bSJdID09IGxlbihiYXJ1WyJlbnRyaWVzIl0pLCAiZW50X251bSBzYWxhaCIpCiAgICBjZWsoYmFydVsiYXZiIl0gYW5kIGJhcnVbImF2YiJdWzBdID09IGIiQVZCZiIsICJmb290ZXIgQVZCZiBoaWxhbmciKQogICAgaWYgYmFydVsiYXZiIl06CiAgICAgICAgY2VrKGJhcnVbImF2YiJdWzNdID09IGluZm9bImNvbnRlbnRfZW5kIl0sCiAgICAgICAgICAgICJBVkIgb3JpZ19zaXplICVkICE9IGNvbnRlbnQgJWQiICUgKGJhcnVbImF2YiJdWzNdLCBpbmZvWyJjb250ZW50X2VuZCJdKSkKICAgICAgICBjZWsoYmFydVsiYXZiIl1bNF0gKyBiYXJ1WyJhdmIiXVs1XSA8PSBpbmZvWyJwc2l6ZSJdLCAidmJtZXRhIG1lbGViaWhpIHBhcnRpc2kiKQogICAgY2VrKG9zLnBhdGguZ2V0c2l6ZShvdXRfcGF0aCkgPT0gaW5mb1sicHNpemUiXSwKICAgICAgICAidWt1cmFuIGFraGlyICVkICE9IHBhcnRpdGlvbl9zaXplICVkIiAlCiAgICAgICAgKG9zLnBhdGguZ2V0c2l6ZShvdXRfcGF0aCksIGluZm9bInBzaXplIl0pKQogICAgcmV0dXJuIGJhcnUsIGVyciwgbl9jZWtbMF0KCgpkZWYgcmluZ2thcyhoKToKICAgIHByaW50KCIgIGltYWdlICAgOiAlcyAoJXMgQikgc2hhMjU2PSVzLi4uIiAlCiAgICAgICAgICAoaFsiZmlsZSJdLCBmb3JtYXQoaFsic2l6ZSJdLCAiLCIpLCBzaGEyNTYoaFsicmF3Il0pWzozMl0pKQogICAgcHJpbnQoIiAgaGVhZGVyICA6IHYlZCBwYWdlPSVkIHwgY21kbGluZTogJXMiICUgKGhbInZlciJdLCBoWyJwYWdlIl0sIGhbImNtZGxpbmUiXVs6OTBdKSkKICAgIGR0Yl9ub3RlID0gKCJtYWdpYyBPSyIgaWYgaC5nZXQoImR0Yl9tYWdpY19vayIpIGVsc2UKICAgICAgICAgICAgICAgICJtYWdpYyBkMDBkZmVlZCB0aWRhayBkaXRlbXVrYW4gZGkgNCBLQiBwZXJ0YW1hISIgaWYgaFsiZHRiIl0gZWxzZSAiLSIpCiAgICBwcmludCgiICByYW1kaXNrIDogJXMgQiB8IGR0YiAlcyBCICglcykgfCBib290Y29uZmlnICVzIEIiICUKICAgICAgICAgIChmb3JtYXQoaFsidnJfc2l6ZSJdLCAiLCIpLCBmb3JtYXQoaFsiZHRiX3NpemUiXSwgIiwiKSwKICAgICAgICAgICBkdGJfbm90ZSwgZm9ybWF0KGhbImJvb3RjZmdfc2l6ZSJdLCAiLCIpKSkKICAgIGZvciBlIGluIGhbImVudHJpZXMiXToKICAgICAgICBwcmludCgiICAgIFslZF0gJS0yNHMgJS05cyAlMTBzIEIgIG9mZj0lLTlkIHNoYT0lcyIgJQogICAgICAgICAgICAgIChlWyJpZHgiXSwgZVsibmFtZSJdIG9yICIodGFucGEtbmFtYSkiLCBOQU1BX1RJUEUuZ2V0KGVbInR5cGUiXSwgZVsidHlwZSJdKSwKICAgICAgICAgICAgICAgZm9ybWF0KGVbInNpemUiXSwgIiwiKSwgZVsib2ZmIl0sIGVbInNoYSJdWzoxNl0pKQoKCiMgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0KIyBDTEkKIyAtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQpkZWYgbWFpbigpOgogICAgYXAgPSBhcmdwYXJzZS5Bcmd1bWVudFBhcnNlcihkZXNjcmlwdGlvbj0iQXNzZW1ibGVyIHZlbmRvcl9ib290IEdLSSB2NCBoaWJyaWRhIikKICAgIHN1YiA9IGFwLmFkZF9zdWJwYXJzZXJzKGRlc3Q9ImNtZCIsIHJlcXVpcmVkPVRydWUpCgogICAgcF9wYWNrID0gc3ViLmFkZF9wYXJzZXIoInBhY2stcmVjb3Zlcnktcm9vdCIsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBoZWxwPSJrZW1hcyByZWNvdmVyeSByb290IC0+IGNwaW8uZ3ogZnJhZ21lbnQiKQogICAgcF9wYWNrLmFkZF9hcmd1bWVudCgicm9vdCIpCiAgICBwX3BhY2suYWRkX2FyZ3VtZW50KCJvdXQiKQoKICAgIHBfYnVpbGQgPSBzdWIuYWRkX3BhcnNlcigiYnVpbGQiLCBoZWxwPSJyYWtpdCB2ZW5kb3JfYm9vdCBoaWJyaWRhIikKICAgIHBfYnVpbGQuYWRkX2FyZ3VtZW50KCItLXN0b2NrIiwgcmVxdWlyZWQ9VHJ1ZSkKICAgIHBfYnVpbGQuYWRkX2FyZ3VtZW50KCItLXJlY292ZXJ5LWZyYWdtZW50IikKICAgIHBfYnVpbGQuYWRkX2FyZ3VtZW50KCItLXJlY292ZXJ5LXJvb3QiKQogICAgcF9idWlsZC5hZGRfYXJndW1lbnQoIi0tb3V0IiwgcmVxdWlyZWQ9VHJ1ZSkKICAgIHBfYnVpbGQuYWRkX2FyZ3VtZW50KCItLWF2YnRvb2wiLCBkZWZhdWx0PSIiKQogICAgcF9idWlsZC5hZGRfYXJndW1lbnQoIi0tcGFydGl0aW9uLXNpemUiLCB0eXBlPWludCwgZGVmYXVsdD0wKQogICAgcF9idWlsZC5hZGRfYXJndW1lbnQoIi0tZW50cnktbmFtZSIsIGRlZmF1bHQ9InJlY292ZXJ5IikKICAgIHBfYnVpbGQuYWRkX2FyZ3VtZW50KCItLW5vLXZlcmlmeSIsIGFjdGlvbj0ic3RvcmVfdHJ1ZSIsCiAgICAgICAgICAgICAgICAgICAgICAgICBoZWxwPSJsZXdhdGkgYXZidG9vbCB2ZXJpZnlfaW1hZ2UiKQoKICAgIHBfaW5zID0gc3ViLmFkZF9wYXJzZXIoImluc3BlY3QiLCBoZWxwPSJpbnNwZWtzaSB2ZW5kb3JfYm9vdCB2NCIpCiAgICBwX2lucy5hZGRfYXJndW1lbnQoImltYWdlIikKCiAgICBhID0gYXAucGFyc2VfYXJncygpCgogICAgaWYgYS5jbWQgPT0gInBhY2stcmVjb3Zlcnktcm9vdCI6CiAgICAgICAgcGFja19yZWNvdmVyeV9yb290KGEucm9vdCwgYS5vdXQpCiAgICAgICAgcmV0dXJuIDAKCiAgICBpZiBhLmNtZCA9PSAiaW5zcGVjdCI6CiAgICAgICAgcmluZ2thcyhwYXJzZV92YihhLmltYWdlKSkKICAgICAgICByZXR1cm4gMAoKICAgICMgLS0tLSBidWlsZAogICAgaWYgbm90IGEucmVjb3ZlcnlfZnJhZ21lbnQgYW5kIG5vdCBhLnJlY292ZXJ5X3Jvb3Q6CiAgICAgICAgYXAuZXJyb3IoIi0tcmVjb3ZlcnktZnJhZ21lbnQgYXRhdSAtLXJlY292ZXJ5LXJvb3Qgd2FqaWIiKQogICAgaWYgYS5yZWNvdmVyeV9yb290OgogICAgICAgIGlmIG5vdCBvcy5wYXRoLmlzZmlsZShvcy5wYXRoLmpvaW4oYS5yZWNvdmVyeV9yb290LCAic3lzdGVtL2Jpbi9yZWNvdmVyeSIpKToKICAgICAgICAgICAgcmFpc2UgU3lzdGVtRXhpdCgiWyFdICVzL3N5c3RlbS9iaW4vcmVjb3ZlcnkgdGlkYWsgYWRhIOKAlCByZWNvdmVyeSByb290ICIKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAiYmVsdW0gdGVyaXNpIGJ1aWxkLiAoQ2VrOiBvdXQvdGFyZ2V0L3Byb2R1Y3QvPGRldj4vcmVjb3Zlcnkvcm9vdCkiCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgJSBhLnJlY292ZXJ5X3Jvb3QpCiAgICAgICAgZnJhZyA9IGEub3V0ICsgIi5yZWNvdmVyeS5jcGlvLmd6IgogICAgICAgIHBhY2tfcmVjb3Zlcnlfcm9vdChhLnJlY292ZXJ5X3Jvb3QsIGZyYWcpCiAgICBlbHNlOgogICAgICAgIGZyYWcgPSBhLnJlY292ZXJ5X2ZyYWdtZW50CgogICAgaW5mbyA9IGFzc2VtYmxlKGEuc3RvY2ssIGZyYWcsIGEub3V0LCBlbnRyeV9uYW1lPWEuZW50cnlfbmFtZSwKICAgICAgICAgICAgICAgICAgICBwYXJ0aXRpb25fc2l6ZT1hLnBhcnRpdGlvbl9zaXplIG9yIE5vbmUpCiAgICBwcmludCgiWytdIGtvbnRlbiBoaWJyaWRhIDogJXMgQiAocGFydGl0aW9uLXNpemUgJXMgQikiICUKICAgICAgICAgIChmb3JtYXQoaW5mb1siY29udGVudF9lbmQiXSwgIiwiKSwgZm9ybWF0KGluZm9bInBzaXplIl0sICIsIikpKQogICAgYWRkX2F2Yl9mb290ZXIoYS5vdXQsIGluZm9bInBzaXplIl0sIGEuYXZidG9vbCkKICAgIHByaW50KCJbK10gZm9vdGVyIEFWQiAgICAgOiBhZGRfaGFzaF9mb290ZXIgT0sgKGFsZ29yaXRobSBOT05FKSIpCgogICAgYmFydSwgZXJyLCBuX2NlayA9IHNlbGZjaGVjayhpbmZvLCBlbnRyeV9uYW1lPWEuZW50cnlfbmFtZSkKICAgIGlmIGVycjoKICAgICAgICBmb3IgZSBpbiBlcnI6CiAgICAgICAgICAgIHByaW50KCJbRkFJTF0gJXMiICUgZSkKICAgICAgICByYWlzZSBTeXN0ZW1FeGl0KCJbIV0gU0VMRi1WRVJJRlkgR0FHQUwgKCVkKSDigJQgamFuZ2FuIGZsYXNoIGltYWdlIGluaSEiICUgbGVuKGVycikpCiAgICBwcmludCgiWytdIFNFTEYtVkVSSUZZICAgIDogJWQgcGVtZXJpa3NhYW4gbG9sb3MgKGJsb2Igc3RvayBpZGVudGlrLCAiCiAgICAgICAgICAiZW50cmkgUkVDT1ZFUlkgJXMsIGR0Yi9jbWRsaW5lL2Jvb3Rjb25maWcgc3RvaykiICUKICAgICAgICAgIChuX2NlaywgImRpZ2FudGkgaXNpLW55YSIgaWYgaW5mb1siZ2FudGkiXSBlbHNlICJkaXRhbWJhaGthbiIpKQoKICAgIGlmIG5vdCBhLm5vX3ZlcmlmeSBhbmQgYS5hdmJ0b29sOgogICAgICAgIG9rLCBsb2cgPSB2ZXJpZnlfYXZiKGEub3V0LCBhLmF2YnRvb2wpCiAgICAgICAgcHJpbnQoIlsrXSBhdmJ0b29sIHZlcmlmeSA6ICVzIiAlICgiT0siIGlmIG9rIGVsc2UKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICJESUxFV0FUSSAoYWxnb3JpdGhtIE5PTkUpOiAlcyIgJSBsb2dbOjEyMF0pKQoKICAgIHByaW50KCJcbj09PSBUQUJFTCB2ZW5kb3JfcmFtZGlzayBIQVNJTCBISUJSSURBID09PSIpCiAgICByaW5na2FzKGJhcnUpCiAgICBwcmludCgiXG5GaWxlIHNpYXA6ICVzICglcyBCKSIgJSAoYS5vdXQsIGZvcm1hdChvcy5wYXRoLmdldHNpemUoYS5vdXQpLCAiLCIpKSkKICAgIHJldHVybiAwCgoKaWYgX19uYW1lX18gPT0gIl9fbWFpbl9fIjoKICAgIHRyeToKICAgICAgICBzeXMuZXhpdChtYWluKCkpCiAgICBleGNlcHQgQnJva2VuUGlwZUVycm9yOgogICAgICAgIHN5cy5leGl0KDApCg==' | base64 -d > "$TMPH/build_hybrid_vb.py"
+          # Korupsi apa pun = gagal cepat, sebelum menyentuh image apa pun.
+          python3 -m py_compile "$TMPH/build_hybrid_vb.py"
+
+          echo "== 4/5 Assembling + self-verifying the hybrid image =="
+          # Output HARUS bernama vendor_boot.img saat verify: avbtool
+          # resolve hash-descriptor partisi kembali ke file bernama persis
+          # sama di direktori kerja. Mode otomatis: stok punya entri
+          # RECOVERY (stok malachite memang punya) -> isi fragment diganti;
+          # stok tanpa entri RECOVERY -> entri baru type-2 ditambahkan.
+          python3 "$TMPH/build_hybrid_vb.py" build \
+            --stock "$STOCK" \
+            --recovery-root "$RR" \
+            --out "$TMPH/asm/vendor_boot.img" \
+            --avbtool "$TMPH/avbtool.py" \
+            --partition-size "$(stat -c%s "$STOCK")"
+
+          echo "== 5/5 Publishing artifacts =="
+          HYBRID="OrangeFox-${ARTIFACT_LABEL}-${DEVICE_CODENAME}-hybrid.img"
+          cp "$TMPH/asm/vendor_boot.img" "$ART/$HYBRID"
+          cp "$STOCK" "$ART/stock-vendor_boot-${DEVICE_CODENAME}.img"
+          {
+            echo "### Hybrid vendor_boot (PRIMARY - flash this one)"
+            echo ""
+            echo "- PLATFORM fragment, DTB, cmdline, bootconfig: byte-identical to stock"
+            echo "- Stock RECOVERY fragment entry kept (name/type/board_id) - content replaced"
+            echo "  with the OrangeFox recovery rootfs"
+            echo "- Normal boot = stock behaviour; recovery boot = OrangeFox"
+            echo ""
+            echo '```'
+            sha256sum "$ART/$HYBRID" "$ART/stock-vendor_boot-${DEVICE_CODENAME}.img"
+            echo '```'
+            echo ""
+            echo "### Hybrid vendor_ramdisk table"
+            echo '```'
+            python3 "$TMPH/build_hybrid_vb.py" inspect "$ART/$HYBRID"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          ls -la "$ART"
 
       - name: Collect build artifacts
         run: |
