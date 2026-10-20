@@ -6,36 +6,18 @@ on:
     branches: [ main, master ]
 
 env:
-  # OrangeFox manifest (fox_16.0 = Android 16 based, the only active branch)
   MANIFEST_URL: https://gitlab.com/OrangeFox/Manifest.git
   MANIFEST_BRANCH: fox_16.0
-  # Verified device tree base (TWRP for malachite, Android 16, hardware-tested)
   DEVICE_TREE_URL: https://github.com/mytiantian001/android_device_xiaomi_malachite_twrp
   DEVICE_TREE_BRANCH: A16
   DEVICE_PATH: device/xiaomi/malachite
   DEVICE_CODENAME: malachite
-  # Recovery lives in vendor_boot on this device (A/B, no dedicated recovery partition)
   BUILD_TARGET: vendorbootimage
-  # Shown inside the recovery UI (About page). Keep this value UNQUOTED:
-  # the OrangeFox build glue adds the C-level quotes itself when it emits
-  # the -D flags, so literal quotes here would end up doubled in C++.
   MAINTAINER: VikrieGunawan
-  # ---- Version / build type (maintainer request: R12.0_0 Beta) ----
-  # OrangeFox_A16.sh composes the displayed release as:
-  #   FOX_BUILD = FOX_INTERNAL_RELEASE ("R12.0", exported inside that script)
-  #             + "_" + FOX_MAINTAINER_PATCH_VERSION            -> "R12.0_0"
-  # and names the image "OrangeFox-$FOX_BUILD-$FOX_BUILD_TYPE-$DEVICE.img"
-  #   -> OrangeFox-R12.0_0-Beta-malachite.img (also shown on the About page).
-  # Both vars are READ from the environment by OrangeFox_A16.sh, so setting
-  # them here is sufficient - no device-tree edits needed.
   FOX_MAINTAINER_PATCH_VERSION: "0"
   FOX_BUILD_TYPE: Beta
-  # Short label used by the artifact names below (keep in sync with the above)
   ARTIFACT_LABEL: R12.0_0-Beta
 
-# Never run two builds at once: a new push/dispatch automatically replaces a
-# running build. (The replaced run ends with exit code 143 — that is the normal
-# cancellation signal, not a build error.)
 concurrency:
   group: orangefox-malachite-build
   cancel-in-progress: true
@@ -43,28 +25,13 @@ concurrency:
 jobs:
   build:
     name: Build OrangeFox R12.0_0-Beta (malachite)
-    # Pinned deliberately: ubuntu-22.04 is deprecated (support ended 2026-09-17)
-    # and 'ubuntu-latest' is mid-migration from 24.04 to 26.04 (Oct-Nov 2026),
-    # so 'ubuntu-latest' would make builds non-reproducible while the image
-    # changes under them. 24.04 is the current stable supported image.
     runs-on: ubuntu-24.04
-    # Hard cap for GitHub-hosted runners is 360 minutes per job.
     timeout-minutes: 360
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      # -------------------------------------------------------------------
-      # CRITICAL FIX for the previous run:
-      #   GitCommandError ... platform/prebuilts/rust
-      #   fatal: write error: No space left on device
-      # The fox_16.0 slimmed tree (~405 shallow projects) needs roughly
-      # 90-100 GB (git packs + checked-out worktrees incl. prebuilts). The
-      # preinstalled runner image ships ~35 GB of SDKs / language toolchains
-      # / container data that this build never touches — removing them up
-      # front is what makes the sync fit on the ~145 GB hosted-runner disk.
-      # -------------------------------------------------------------------
       - name: Free up disk space and set up swap (pre-sync)
         run: |
           set -e
@@ -72,7 +39,6 @@ jobs:
                       /opt/hostedtoolcache /usr/local/lib/android /opt/pipx \
                       /opt/az /usr/share/miniconda /opt/conda /usr/local/lib/node_modules \
                       /usr/lib/jvm/temurin-8-jdk-amd64 /usr/lib/jvm/temurin-11-jdk-amd64
-          # Docker daemon and its data: nothing in this workflow uses containers.
           sudo systemctl stop docker docker.socket containerd >/dev/null 2>&1 || true
           sudo rm -rf /var/lib/docker /var/lib/containerd
           sudo docker image prune -af >/dev/null 2>&1 || true
@@ -80,21 +46,6 @@ jobs:
           sudo journalctl --vacuum-size=50M >/dev/null 2>&1 || true
           echo "Disk after cleanup:"
           df -h /
-          # ---------------------------------------------------------------
-          # Swap setup — moved BEFORE the sync on purpose:
-          #   The ubuntu-24.04 runner image ALREADY ships an ACTIVE 4 GB
-          #   /swapfile (ubuntu-22.04 used /mnt/swapfile instead). Running
-          #   `fallocate /swapfile` on the active file fails with
-          #   "Text file busy" (ETXTBSY) — this exact error killed a run
-          #   AFTER the 40-minute sync had completed. Doing it here means
-          #   any runner-environment surprise costs 2 minutes, not 40+.
-          #
-          # Size = 16 GB, measured 2026-10-19: with 8 GB swap (23 GB total
-          # capacity) soong_build was OOM-killed TWICE in one run at
-          # anon-rss 14.7 GB. Peak demand ~17-20 GB, so the new capacity is
-          # 15 GB RAM + 16 GB swap = 31 GB. Disk cost is affordable: the
-          # synced tree + base image leave ~30 GB free with swap in place.
-          # ---------------------------------------------------------------
           if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile'; then
             echo "Existing /swapfile is active — switching it off before resizing."
             sudo swapoff /swapfile 2>/dev/null || sudo swapoff -a || true
@@ -116,8 +67,6 @@ jobs:
         run: |
           set -e
           sudo apt-get update -qq
-          # ubuntu-24.04 package fallbacks: libncurses5 and libgl1-mesa-dev may
-          # not exist on newer images — try the classic name, fall back silently.
           sudo apt-get install -y -qq git zip curl build-essential libgl1-mesa-dev \
             libxml2-utils xsltproc unzip rsync m4 >/dev/null || \
             sudo apt-get install -y -qq git zip curl build-essential libgl-dev \
@@ -136,16 +85,6 @@ jobs:
           mkdir -p workspace/fox_16.0
           cd workspace/fox_16.0
           repo init --depth=1 -u "$MANIFEST_URL" -b "$MANIFEST_BRANCH"
-          # -----------------------------------------------------------------
-          # IMPORTANT — fix for a previous run's failure:
-          # The fox_16.0 manifest chain (default.xml -> twrp-default.xml ->
-          # fox.xml + remove-minimal.xml) ALREADY applies OrangeFox's minimal
-          # project list by itself. A plain sync fetches ~405 projects, NOT
-          # the full ~990-project AOSP tree. Do NOT add any remove-project
-          # overlay of our own: it is a FATAL DUPLICATE and aborts the sync
-          # with "remove-project element specifies non-existent project".
-          # We only verify the manifest parses, then sync.
-          # -----------------------------------------------------------------
           if repo manifest -o /tmp/combined_manifest.xml >/dev/null 2>/tmp/manifest_check.err; then
             echo "Manifest parse: OK ($(grep -c '<project ' /tmp/combined_manifest.xml) projects after OrangeFox's own slimming)"
           else
@@ -184,8 +123,6 @@ jobs:
                 break
               fi
             done
-            # Commit the edit so the manifests worktree stays clean when
-            # repo sync updates the manifests project (it rebases).
             git -C .repo/manifests add -A >/dev/null 2>&1 || true
             git -C .repo/manifests commit -qm "CI: strip dangling remove-project entries" >/dev/null 2>&1 || true
             if ! repo manifest -o /tmp/combined_manifest.xml >/dev/null 2>/tmp/manifest_check.err; then
@@ -195,28 +132,6 @@ jobs:
             fi
             echo "Manifest parse: OK after auto-fix ($(grep -c '<project ' /tmp/combined_manifest.xml) projects)"
           fi
-          # -----------------------------------------------------------------
-          # Pre-flight repair for fox_16.0 work-in-progress pins.
-          #
-          # Verified 2026-10-19: the fox_16.0 manifest pins several BRAND NEW
-          # OrangeFox-fork repos that are not publicly fetchable yet:
-          #   external/libarchive  -> HTTP 401 (private/not published)
-          #   external/libfuse3    -> HTTP 401 (private/not published)
-          #   external/fox-go      -> HTTP 404 (does not exist publicly)
-          #   external/rclone      -> public, but its genrule uses
-          #                           tools: ["fox_go"] from the missing fox-go
-          # repo sync then aborts deterministically with
-          #   "Unable to remote fetch project external/libarchive".
-          # Substituting/removing them is SAFE: a full audit of
-          # bootable/recovery (62 Android.bp/Android.mk files, fox_16.0) and
-          # of vendor/recovery (main) shows NO build rule references
-          # libarchive, libfuse3, rclone, fox-go, ttyd, libuv, json-c or
-          # libwebsockets; only external/libvterm is mandatory ($(error) in
-          # orangefox.mk) and it is public. Removing these makes the project
-          # set identical to the previously-proven-syncable manifest state.
-          # When OrangeFox publishes the repos, the probes below pass and
-          # this overlay becomes a no-op automatically.
-          # -----------------------------------------------------------------
           python3 - <<'PYEOF'
           import xml.etree.ElementTree as ET
           tree = ET.parse("/tmp/combined_manifest.xml")
@@ -247,7 +162,6 @@ jobs:
             OK=0
             for TRY in 1 2; do
               if [ "${#REV}" -eq 40 ]; then
-                # SHA-pinned project: probe exactly what repo sync will do.
                 rm -rf /tmp/pin_probe
                 if git init -q /tmp/pin_probe 2>/dev/null && \
                    timeout 120 git -C /tmp/pin_probe fetch --depth=1 "$URL" "$REV" >/dev/null 2>&1; then
@@ -275,8 +189,6 @@ jobs:
           for line in open("/tmp/fox_probe_result.tsv"):
               name, ok = line.strip().split("|")
               probe[name] = ok == "1"
-          # Optional OrangeFox extras: absence cannot break the build
-          # (verified against bootable/recovery fox_16.0 + vendor/recovery main).
           REMOVABLE_OK = {
               "external/libarchive", "external/libfuse3", "external/fox-go",
               "external/rclone", "external/ttyd", "external/libuv",
@@ -286,15 +198,10 @@ jobs:
           for name, ok in probe.items():
               if not ok and name in REMOVABLE_OK:
                   removals.add(name)
-          # rclone's genrule (fox_nas_rclone_build_defaults) needs the
-          # "fox_go" tool from fox-go: remove them as a pair.
           if "external/fox-go" in removals:
               removals.add("external/rclone")
           for name, ok in probe.items():
               if not ok and name not in REMOVABLE_OK:
-                  # Core trees: repo init already proved gitlab.com is
-                  # reachable, so this is probe flakiness — warn, do not
-                  # remove, and let repo sync surface the real error.
                   print(f"  WARNING: {name} probe failed but is not on the removable list; keeping it.")
           os.makedirs(".repo/local_manifests", exist_ok=True)
           overlay = ".repo/local_manifests/ci-remove-unreachable-fox-repos.xml"
@@ -324,18 +231,9 @@ jobs:
               exit 1
             fi
           fi
-          # Disk watchdog: prints one df line every 3 minutes so a long sync
-          # is always distinguishable from a hung one in the Actions log.
           ( while true; do sleep 180; echo "[disk-watchdog] $(date -u) $(df -h / | tail -n 1)"; done ) &
           WATCHDOG_PID=$!
           trap 'kill "$WATCHDOG_PID" 2>/dev/null || true' EXIT
-          # -----------------------------------------------------------------
-          # Three sync attempts. Between attempts the partially fetched tree
-          # is KEPT (nothing is deleted), so --force-sync on attempts 2/3
-          # reconciles and resumes instead of starting over from zero.
-          # -j is lowered on each retry: fewer parallel fetches = smaller
-          # transient disk peak (each project holds pack + worktree at once).
-          # -----------------------------------------------------------------
           SYNC_OK=0
           for ATTEMPT in 1 2 3; do
             case "$ATTEMPT" in
@@ -371,7 +269,6 @@ jobs:
           set -e
           cd workspace/fox_16.0
           FAIL=0
-          # Mandatory entries: the build cannot proceed without them.
           if [ ! -f build/envsetup.sh ]; then
             echo "ERROR: build/envsetup.sh is missing. repo sync did not complete correctly."
             FAIL=1
@@ -385,9 +282,6 @@ jobs:
             FAIL=1
           fi
           if [ "$FAIL" -eq 1 ]; then exit 1; fi
-          # Informational only: a root-level vendorsetup.sh is a legacy AOSP artifact.
-          # fox_16.0 does NOT ship one and does NOT need it — product discovery is
-          # done through AndroidProducts.mk. Never fail the build over it.
           if [ ! -f vendorsetup.sh ]; then
             echo "NOTE: root vendorsetup.sh is absent — normal for fox_16.0, continuing."
           fi
@@ -411,8 +305,6 @@ jobs:
             echo "No patch present, skipping."
             exit 0
           fi
-          # Required per the device tree README: prevents an optional vibration
-          # request from blocking the touch interface before servicemanager is up.
           if git -C "$REPO_DIR/bootable/recovery" apply --check "$PATCH" 2>/dev/null; then
             git -C "$REPO_DIR/bootable/recovery" apply "$PATCH"
             echo "Haptics patch applied to bootable/recovery."
@@ -423,21 +315,6 @@ jobs:
             echo "WARNING: patch does not apply cleanly (likely already fixed upstream). Continuing."
           fi
 
-          # -----------------------------------------------------------------
-          # CRITICAL memory patch for soong_build (measured 2026-10-19):
-          #   soong_ui launches soong_build via `env -i` — a WIPED
-          #   environment. Exported GOMEMLIMIT/GOGC NEVER reach the child
-          #   process (proven twice: OOM-killed with an unbounded Go heap,
-          #   total-vm growing 24 GB -> 31 GB and 15.5 GB of swap fully
-          #   consumed while GOMEMLIMIT was exported in the shell).
-          #   Instead of relying on the environment, patch the soong_build
-          #   entry point to call Go's runtime/debug.SetMemoryLimit()
-          #   directly — semantically identical to GOMEMLIMIT but impossible
-          #   to strip via env -i. 14 GiB keeps the GC compacting well
-          #   before the 31 GB capacity (15 GB RAM + 16 GB swap) is reached.
-          #   Fail-fast if upstream moved the file/anchors: silently
-          #   skipping would burn a 40-minute sync on another OOM.
-          # -----------------------------------------------------------------
           cd "$REPO_DIR"
           python3 - <<'SOONGEOF'
           import os, re
@@ -449,13 +326,11 @@ jobs:
           if "debug.SetMemoryLimit" in src:
               print("soong_build main.go already patched (debug.SetMemoryLimit present).")
               raise SystemExit(0)
-          # 1) make sure the runtime/debug import exists
           if '"runtime/debug"' not in src:
               m = re.search(r'import \(\n', src)
               if not m:
                   raise SystemExit("FAIL-FAST: no 'import (' block found in %s" % path)
               src = src[:m.end()] + '\t"runtime/debug"\n' + src[m.end():]
-          # 2) inject the limit as the first statement of main()
           m = re.search(r'func main\(\) \{\n', src)
           if not m:
               raise SystemExit("FAIL-FAST: no 'func main() {' anchor found in %s" % path)
@@ -469,25 +344,6 @@ jobs:
           echo "Patch verification (soong_build main.go):"
           grep -n "SetMemoryLimit\|runtime/debug" build/soong/cmd/soong_build/main.go
 
-          # -----------------------------------------------------------------
-          # LLNDK/VNDK ABI compatibility gates - killed at source (measured
-          # 2026-10-19). android-16.0.0_r1 (the exact revision fox_16.0 syncs)
-          # hard-fails the build at header-abi-diff when a rebuilt LLNDK
-          # library (first hit: libbinder_ndk) does not match the checked-in
-          # reference dumps (prebuilts/abi-dumps/vndk/202404/...).
-          # AOSP itself ships an escape hatch for exactly this: SKIP_ABI_CHECKS
-          # (build/soong/cc/sabi.go: "Escape hatch to not check any ABI
-          # dump."). It is read via ctx.Config().IsEnvTrue() - but soong_ui
-          # launches soong_build through a wiped environment (proven twice with
-          # GOMEMLIMIT), so the flag can never arrive by exporting it. Activate
-          # the same hatch at source level: the two mutator sites below are the
-          # ONLY writers of ShouldCreateSourceAbiDump (verified in
-          # android-16.0.0_r1: cc/sabi.go + cc/library.go:661,1567), so no
-          # lsdump/header-abi-diff task is ever generated. This is build-time
-          # hygiene only: AOSP already exempts recovery variants from these
-          # checks ("Don't check ramdisk or recovery variants") and the dumps
-          # produce no runtime artifact. Fail-fast if upstream moved the hatch.
-          # -----------------------------------------------------------------
           python3 - <<'SABIEOF'
           import os
           path = "build/soong/cc/sabi.go"
@@ -518,14 +374,6 @@ jobs:
         run: |
           set -e
           REPO_DIR="$GITHUB_WORKSPACE/workspace/fox_16.0"
-          # -----------------------------------------------------------------
-          # fox_16.0 HARD-FAILS on the renamed (obsolete) OrangeFox variables
-          # (bootable/recovery/orangefox.mk: '"OF_AB_DEVICE" is obsolete. Use
-          # "export FOX_AB_DEVICE=1" instead.' - measured 2026-10-19).
-          # Rewrite any stale names in the device tree to their fox_16.0
-          # spellings before anything reads them. The \b word boundaries keep
-          # the still-valid OF_AB_DEVICE_WITH_RECOVERY_PARTITION untouched.
-          # -----------------------------------------------------------------
           sed -i \
             -e 's/\bOF_VIRTUAL_AB_DEVICE\b/FOX_VIRTUAL_AB_DEVICE/g' \
             -e 's/\bOF_AB_DEVICE\b/FOX_AB_DEVICE/g' \
@@ -536,53 +384,23 @@ jobs:
             -e 's/\bFOX_ADVANCED_SECURITY\b/OF_ADVANCED_SECURITY/g' \
             -e 's/\bFOX_USE_LZ4_COMPRESSION\b/OF_USE_LZ4_COMPRESSION/g' \
             "$REPO_DIR/$DEVICE_PATH/"*.mk
-          # Sanity net: after the rewrite, no renamed variable may remain.
           if grep -HEq '\b(OF_VIRTUAL_AB_DEVICE|OF_AB_DEVICE|OF_PATCH_VBMETA_FLAG|OF_VANILLA_BUILD|OF_TARGET_DEVICES|FOX_USE_LZMA_COMPRESSION|FOX_ADVANCED_SECURITY|FOX_USE_LZ4_COMPRESSION)\b[[:space:]]*[:+?]?=' "$REPO_DIR/$DEVICE_PATH/"*.mk; then
             echo "FAIL-FAST: obsolete OrangeFox variables remain after rewrite:"
             grep -HnE '\b(OF_VIRTUAL_AB_DEVICE|OF_AB_DEVICE|OF_PATCH_VBMETA_FLAG|OF_VANILLA_BUILD|OF_TARGET_DEVICES|FOX_USE_LZMA_COMPRESSION|FOX_ADVANCED_SECURITY|FOX_USE_LZ4_COMPRESSION)\b[[:space:]]*[:+?]?=' "$REPO_DIR/$DEVICE_PATH/"*.mk
             exit 1
           fi
-          # Pattern taken from the official OrangeFox fox_16.0 reference tree
-          # (device/xiaomi/mondrian), adapted for an A/B vendor_boot-only device:
-          # no OF_AB_DEVICE_WITH_RECOVERY_PARTITION here, because malachite has
-          # no dedicated recovery partition (recovery lives in vendor_boot).
           cat >> "$REPO_DIR/$DEVICE_PATH/BoardConfig.mk" <<EOF
 
-          # ---- OrangeFox Recovery (fox_16.0) ----
-          # fox_16.0 renamed OF_AB_DEVICE to FOX_AB_DEVICE (the old spelling is
-          # a hard kati error). FOX_AB_DEVICE is also auto-set by orangefox.mk
-          # because device.mk sets AB_OTA_UPDATER := true, and it is exported by
-          # the derived vendorsetup.sh below; the explicit assignment keeps the
-          # configuration self-sufficient even if those two paths change.
           FOX_AB_DEVICE := 1
           OF_SCREEN_H := 2712
           OF_STATUS_INDENT_LEFT := 48
           OF_STATUS_INDENT_RIGHT := 48
           OF_CLOCK_POS := 1
           OF_ADVANCED_SECURITY := 1
-          # String values must stay UNQUOTED: the OrangeFox build glue wraps
-          # each value in C quotes when emitting -D flags. A quoted value
-          # here produced ""..."" and failed C++11 compilation with
-          # "invalid suffix on literal" (orscmd.cpp, measured 2026-10-20).
           OF_MAINTAINER := $MAINTAINER
           EOF
           echo "OrangeFox configuration appended:"
           tail -18 "$REPO_DIR/$DEVICE_PATH/BoardConfig.mk"
-          # -----------------------------------------------------------------
-          # Fix for the Android 16 soong analysis error (measured 2026-10-19):
-          #   module "prebuilt_com.android.crashrecovery-systemserverclasspath-fragment":
-          #   [service-crashrecovery] in contents must also be declared in
-          #   PRODUCT_APEX_SYSTEM_SERVER_JARS
-          # CrashRecovery became a Mainline module in A16 and ships a NEW
-          # system-server classpath fragment that TWRP-style product configs
-          # do not declare yet. The proven community fix (A16 TWRP trees,
-          # e.g. device_xiaomi_onyx-TWRP) is exactly one line; the
-          # "apexname:jarname" format is documented at source.android.com
-          # (Configure ART). It is appended to the LEAF product file
-          # (twrp_malachite.mk) so nothing inherited afterwards overrides it.
-          # NOTE: PRODUCT_* variables belong in a product .mk, never in
-          # BoardConfig.mk (which is for BOARD_* variables).
-          # -----------------------------------------------------------------
           if [ -f "$REPO_DIR/$DEVICE_PATH/twrp_malachite.mk" ]; then
             PRODUCT_MK="$REPO_DIR/$DEVICE_PATH/twrp_malachite.mk"
           else
@@ -590,17 +408,10 @@ jobs:
           fi
           cat >> "$PRODUCT_MK" <<EOF
 
-          # Fix for the A16 CrashRecovery soong error (added by CI)
           PRODUCT_APEX_SYSTEM_SERVER_JARS += com.android.crashrecovery:service-crashrecovery
           EOF
           echo "CrashRecovery PRODUCT_APEX_SYSTEM_SERVER_JARS fix appended to $PRODUCT_MK:"
           tail -4 "$PRODUCT_MK"
-          # Official fox_16.0 device trees ship a vendorsetup.sh that exports
-          # the device's FOX_* build variables (bash shell, nano editor, app
-          # manager, virtual A/B, ...). The manifest already syncs the official
-          # reference tree (device/xiaomi/mondrian), so derive malachite's copy
-          # from it — that keeps the pattern byte-identical to the proven
-          # reference. Only the device name needs replacing.
           if [ -f "$REPO_DIR/device/xiaomi/mondrian/vendorsetup.sh" ]; then
             sed 's/FDEVICE="mondrian"/FDEVICE="malachite"/' \
               "$REPO_DIR/device/xiaomi/mondrian/vendorsetup.sh" \
@@ -612,32 +423,6 @@ jobs:
             echo "         continuing without FOX_* environment setup."
           fi
 
-      # -------------------------------------------------------------------
-      # T15 root cause (measured 2026-10-19, ninja died at 45%, 56 min):
-      #   system/sepolicy/vendor/hal_hwcrypto_default.te:2:
-      #   ERROR 'attribute hal_hwcrypto_server is not declared'
-      # fox_16.0 = android-16.0.0_r1. In that tree the platform vendor
-      # policy unconditionally references symbols that PUBLIC policy only
-      # declares inside starting_at_board_api(202504, ...) conditionals:
-      #   vendor/hal_hwcrypto_default.te        -> hal_hwcrypto{,_client,_server}
-      #   vendor/hal_mediaquality_default.te    -> hal_mediaquality{,_client,_server}
-      #   vendor/hal_vm_capabilities_default.te -> hal_vm_capabilities{,_client,_server}
-      #   vendor/tee.te                         -> attribute tee_service_type
-      # The conditionals expand only when target_board_api_level >= 202504.
-      # system/sepolicy/build/soong/selinux.go injects
-      #   -D target_board_api_level=$(VendorApiLevel)
-      # and VendorApiLevel() derives from BOARD_API_LEVEL - which TWRP
-      # device trees (incl. malachite) never set. Google builds this exact
-      # tag with BOARD_API_LEVEL=202504 (Pixel boards), so the vendor file
-      # is INTENDED to compile with the 202504 blocks active.
-      # Fix: pin the m4 variable to 202504 inside flagging/flagging_macros.
-      # In m4 a later define() overrides the -D command-line define, and
-      # flagging_macros reaches every se_policy_conf through the
-      # se_policy_conf_flags_defaults defaults (vendor_sepolicy.conf lists
-      # it), before any use of the macros. This pins ONLY the sepolicy
-      # flagging semantics - exporting BOARD_API_LEVEL instead would shift
-      # unrelated parts of the build (VINTF, sysprops, apex).
-      # -------------------------------------------------------------------
       - name: Pin sepolicy board-API flagging to 202504 (fox_16.0)
         run: |
           set -e
@@ -647,7 +432,6 @@ jobs:
             echo "FAIL-FAST: $MACROS not found (unexpected tree layout)"
             exit 1
           fi
-          # Shape check: this fix relies on the exact upstream macro pair.
           if ! grep -q 'define(`starting_at_board_api' "$MACROS" || \
              ! grep -q 'target_board_api_level' "$MACROS"; then
             echo "FAIL-FAST: unexpected flagging_macros content:"
@@ -659,27 +443,11 @@ jobs:
           else
             cat >> "$MACROS" <<'EOF'
 
-          # ==== FOX-MALACHITE-CI: target_board_api_level pinned to 202504 ====
-          # fox_16.0 = android-16.0.0_r1: system/sepolicy/vendor/*.te reference
-          # hal_hwcrypto / hal_mediaquality / hal_vm_capabilities /
-          # tee_service_type, which public policy declares only inside
-          # starting_at_board_api(202504, ...). Google builds this tag with
-          # BOARD_API_LEVEL=202504; TWRP device trees do not set BOARD_API_LEVEL,
-          # so system/sepolicy/build/soong/selinux.go injects a lower
-          # -D target_board_api_level and checkpolicy fails with
-          # "attribute hal_hwcrypto_server is not declared".
-          # In m4 a later define() overrides the -D command-line define.
           define(`target_board_api_level', `202504')
           EOF
           fi
           echo "Pinned flagging_macros (tail):"
           tail -n 13 "$MACROS"
-          # -----------------------------------------------------------------
-          # Behavioral self-test: reproduce soong's m4 invocation shape
-          # (-D target_board_api_level=<low>) and verify that after the pin
-          # starting_at_board_api(202504, ...) expands while
-          # until_board_api(202504, ...) stays suppressed.
-          # -----------------------------------------------------------------
           TESTDIR="$(mktemp -d)"
           cp "$MACROS" "$TESTDIR/flagging_macros"
           cat > "$TESTDIR/use.te" <<'USEEOF'
@@ -702,20 +470,10 @@ jobs:
         run: |
           set -e
           cd "$GITHUB_WORKSPACE/workspace/fox_16.0/$DEVICE_PATH"
-          # Housekeeping before building: docs, metadata and the (already
-          # applied) patch set are not needed by the build system.
           rm -rf .git .github README.md docs patches
           echo "Device tree after cleanup:"
           ls -la
 
-      # -------------------------------------------------------------------
-      # Disk guard: if the sync left < 30 GB free, drop the git object
-      # databases (.repo/projects + .repo/project-objects). The checked-out
-      # working trees are KEPT — the compiler only reads source files, never
-      # git metadata, and the device tree/patches are applied before this
-      # step. The 16 GB swap was already set up BEFORE the sync (first step),
-      # so nothing memory-related can fail here anymore.
-      # -------------------------------------------------------------------
       - name: Reclaim disk space (pre-build)
         run: |
           set -e
@@ -728,9 +486,6 @@ jobs:
             rm -rf .repo/projects .repo/project-objects
             df -h /
           fi
-          # Second-tier reclaim: the checked-in ABI reference dumps
-          # (prebuilts/abi-dumps/*) are dead weight for this build - the ABI
-          # gate is disabled in the patch step, so no ninja task reads them.
           if [ "$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')" -lt 25 ]; then
             echo "Purging unused prebuilts/abi-dumps (ABI checks are disabled)."
             rm -rf prebuilts/abi-dumps
@@ -744,33 +499,13 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE/workspace/fox_16.0"
           echo "Build step started: $(date -u)"
-          # If the runner ever terminates this step (SIGTERM -> exit code 143),
-          # record a resource snapshot so the cause (disk, memory, timeout)
-          # is visible in the log instead of a bare 143.
           trap 'echo "=== Step received termination signal at $(date -u) ==="; df -h /; free -h; ps -eo pid,pcpu,pmem,rss,comm --sort=-rss | head -n 15' TERM INT
-          # Resource snapshot for the record.
           echo "=== Resources before build ==="
           nproc
           free -h
           df -h /
-          # -------------------------------------------------------------------
-          # OOM guard for soong_build (a Go binary). MEASURED on 2026-10-19:
-          # soong_build was OOM-killed twice in one run at anon-rss 14.7 GB
-          # even WITH 8 GB swap (15 GB RAM + 8 GB swap = 23 GB total). The
-          # live Go heap of this tree is genuinely >12 GB — GOMEMLIMIT is a
-          # soft ceiling (the GC compacts near it) but can never reduce the
-          # live set. 14 GiB keeps GC from thrashing while the enlarged
-          # 16 GB swap (31 GB total capacity, set up before the sync) is
-          # what actually prevents the kill.
-          # -------------------------------------------------------------------
           export GOMEMLIMIT=14GiB
-          # Also export the AOSP escape hatch ("SKIP_ABI_CHECKS",
-          # build/soong/cc/sabi.go) for any stage that reads the environment
-          # directly; the deterministic source-level activation lives in the
-          # patch step above (soong_ui wipes the child environment).
           export SKIP_ABI_CHECKS=true
-          # Product name comes from the device tree's AndroidProducts.mk
-          # (fox_16.0 convention keeps the TWRP-style name, e.g. twrp_malachite).
           PRODUCT=$(grep -m1 -oE '(twrp|fox|omni)_[A-Za-z0-9_]+' "$DEVICE_PATH/AndroidProducts.mk" | head -n1)
           if [ -z "$PRODUCT" ]; then
             echo "ERROR: could not detect the product name in $DEVICE_PATH/AndroidProducts.mk"
@@ -778,43 +513,14 @@ jobs:
           fi
           echo "Building product: $PRODUCT"
 
-          # IMPORTANT: never source envsetup with errexit (`set -e`) active.
-          # GitHub Actions enables errexit by default. The OrangeFox envsetup
-          # scans and sources every synced device tree's vendorsetup.sh, and
-          # those scripts contain code paths that legitimately return a
-          # non-zero status. Disable errexit here and validate each stage
-          # explicitly instead.
           set +e
           source build/envsetup.sh
           echo "envsetup sourced (exit code: $?)"
 
-          # -------------------------------------------------------------------
-          # AOSP 16 lunch semantics (fox_16.0 is pinned to android-16.0.0_r1):
-          #   * lunch accepts EITHER the positional form
-          #       'lunch <product> <release> <variant>'
-          #     OR the legacy form 'lunch <product>-<release>-<variant>'
-          #     (exactly 3 dash-separated parts required).
-          #   * 2-part combos like 'twrp_malachite-eng' are REJECTED with
-          #     "Invalid lunch combo" — that is why previous builds died here.
-          #   * The interactive lunch menu was REMOVED ('lunch' with no args
-          #     only prints "No target specified"), so there is nothing to parse.
-          #   * add_lunch_combo is obsolete; COMMON_LUNCH_CHOICES in
-          #     AndroidProducts.mk is what the build system uses (the device
-          #     tree already ships it).
-          # Release configs shipped at android-16.0.0_r1
-          # (platform/build/release/release_configs/): ap2a ap3a ap4a bp1a bp2a,
-          # plus trunk_staging as the default development config.
-          # release_config_map.textproto does NOT gate releases per product,
-          # so every config above is valid for twrp_malachite.
-          # 'ap2a' is tried first because that is the release the device tree
-          # author's own build instructions were verified with.
-          # -------------------------------------------------------------------
           echo "Release configs available in the synced tree:"
           ls build/release/release_configs/ 2>/dev/null | sed 's/^/  /' || echo "  (not found, relying on candidate list)"
 
           CANDIDATES="ap2a trunk_staging bp2a bp1a ap4a ap3a"
-          # Prefer dynamically discovered releases when the helper exists
-          # (build/soong/bin is added to PATH by sourcing envsetup).
           if command -v list_releases >/dev/null 2>&1; then
             DISCOVERED=$(list_releases "$PRODUCT" 2>/dev/null | tr '\n' ' ')
             if [ -n "$DISCOVERED" ]; then
@@ -847,13 +553,6 @@ jobs:
           mka "$BUILD_TARGET" 2>&1 | tee /tmp/mka.log
           BUILD_RC=${PIPESTATUS[0]}
 
-          # Termination-class failures (143=SIGTERM, 137=SIGKILL): check WHY
-          # before retrying. If the kernel OOM-killed soong/kati, a retry in
-          # the SAME run hits the identical memory wall — measured 2026-10-19:
-          # the blind retry was OOM-killed too and only burned ~20 minutes of
-          # swap thrash. Retry ONLY when there is NO OOM evidence (a genuine
-          # runner transient). Soong/kati resume incrementally, so non-OOM
-          # retries are cheap and frequently save the whole run.
           OOM_DETECTED=0
           if sudo dmesg -T 2>/dev/null | grep -qiE 'killed process.*\((soong_build|soong_ui|ckati|ninja)\)'; then
             OOM_DETECTED=1
