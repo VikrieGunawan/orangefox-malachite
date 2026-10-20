@@ -1,45 +1,21 @@
-#!/usr/bin/env python3
-# ============================================================================
-# fox_check_malachite.py v3.1 — Pemeriksa pra-flash vendor_boot.img OrangeFox
-# Perangkat : Xiaomi Redmi Note 14 Pro 5G (malachite)
-# Layout sesuai mkbootimg.py AOSP/LineageOS lineage-23.0 (ground truth):
-#   cmdline 2048 | header_size @2096 | dtb @2100/2104 | tabel v4 @2112 (u32)
-#   entri 108 byte: size, offset, type, name32, board_id64 | region page-align
-#   footer AVB BIG-ENDIAN (bukan little-endian!)
-# v3.1: blob kompresi xz / zstd / lzma kini ikut dibuka (hasil hybrid_assembler v2
-#       yang menghemat partisi 64 MiB dengan codec modern) — xz/lzma via stdlib,
-#       zstd via CLI (Termux: pkg install zstd).
-# Desain ISI malachite (ground truth build/make/core/Makefile lineage-23.0):
-#   tree memakai BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT=true -> build
-#   system MENGGABUNGKAN rootfs recovery ke ramdisk PLATFORM (mkbootimg
-#   menerima --vendor_ramdisk tunggal bertipe PLATFORM, tanpa fragment
-#   RECOVERY terpisah). Tabel TANPA entri bertipe RECOVERY itu NORMAL di
-#   sini; keberadaan recovery dibuktikan langsung dari ISI komponen.
-# Pemakaian:
-#   python fox_check_malachite.py                    (cari otomatis di Download)
-#   python fox_check_malachite.py /path/vendor_boot.img
-#   python fox_check_malachite.py /path/vendor_boot.img /path/vendor_boot_stok.img
-# Keluar: [PASS]/[WARN]/[FAIL] per butir + ringkasan; exit code 0 = aman lanjut.
-# ============================================================================
 import glob, gzip, hashlib, os, struct, subprocess, sys, zipfile
 
 DEV            = "malachite"
-EXP_PAGE       = 4096        # BoardConfig.mk: BOARD_PAGE_SIZE
-EXP_HDR_VER    = 4           # BoardConfig.mk: BOARD_BOOT_HEADER_VERSION
-EXP_PART_SIZE  = 67108864    # BoardConfig.mk: BOARD_VENDOR_BOOTIMAGE_PARTITION_SIZE (64 MiB)
-EXP_HDR_SIZE   = 2128        # VENDOR_BOOT_IMAGE_HEADER_V4_SIZE (mkbootimg.py)
+EXP_PAGE       = 4096        
+EXP_HDR_VER    = 4           
+EXP_PART_SIZE  = 67108864    
+EXP_HDR_SIZE   = 2128        
 EXP_CMDLINE    = "bootopt=64S3,32N2,64N2"
-EXP_FIRMWARE   = "VOOMIXM"   # HyperOS 2.0.208.0.VOOMIXM
+EXP_FIRMWARE   = "VOOMIXM"   
 TYPE_NAME      = {0: "NONE", 1: "PLATFORM", 2: "RECOVERY", 3: "DLKM"}
 
 PASS, FAIL, WARN = [], [], []
-def pok(m):  PASS.append(m); print("  [PASS] " + m)
+def passlog(m):  PASS.append(m); print("  [PASS] " + m)
 def bad(m):  FAIL.append(m); print("  [FAIL] " + m)
 def warn(m): WARN.append(m); print("  [WARN] " + m)
 def info(m): print("  [info] " + m)
 def sect(n, t): print("\n== %s. %s ==" % (n, t))
 
-# ---------------------------------------------------------------- utilitas --
 def sha256(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -63,10 +39,10 @@ def extract_from_zip(zpath):
         cands = [n for n in z.namelist()
                  if "vendor_boot" in n.lower() and n.lower().endswith(".img")]
         if not cands:
-            raise SystemExit("FAIL-FAST: tidak ada vendor_boot*.img di dalam ZIP %s" % zpath)
+            raise SystemExit("FAIL-FAST: no vendor_boot*.img inside ZIP %s" % zpath)
         with open(out, "wb") as f:
             f.write(z.read(cands[0]))
-    print("Diekstrak dari ZIP: %s -> %s" % (os.path.basename(zpath), out))
+    print("Extracted from ZIP: %s -> %s" % (os.path.basename(zpath), out))
     return out
 
 def getprop(key):
@@ -92,7 +68,6 @@ def part_size_sysfs():
 def page_align(x, page):
     return (x + page - 1) // page * page
 
-# ------------------------------------------------------------- parsing CPIO --
 def cpio_entries(raw):
     ent, off = [], 0
     while off + 110 <= len(raw):
@@ -109,8 +84,6 @@ def cpio_entries(raw):
     return ent
 
 def scan_entry_blob(blob):
-    # Buka satu komponen ramdisk dan periksa isinya secara LANGSUNG dari data
-    # (bukti recovery dicari dari isi cpio, bukan dari label tipe di tabel).
     out = {"how": None, "raw": None, "opened": False, "nfiles": 0, "recbin": [],
            "initrc": False, "res": 0, "fox": False, "vg": False}
     raw, how = try_decompress(blob)
@@ -136,19 +109,19 @@ def try_decompress(blob):
         pass
     if blob[:6] in (b"070701", b"070702"):
         return blob, "raw"
-    if blob[:6] == b"\xfd7zXZ\x00":  # kontainer xz (dipakai hybrid_assembler)
+    if blob[:6] == b"\xfd7zXZ\x00":  
         try:
             import lzma
             return lzma.decompress(blob), "xz"
         except Exception:
-            return None, "xz-rusak"
-    if blob[:1] == b"\x5d" and blob[1:3] == b"\x00\x00":  # lzma legacy (.lzma)
+            return None, "xz-corrupt"
+    if blob[:1] == b"\x5d" and blob[1:3] == b"\x00\x00":  
         try:
             import lzma
             return lzma.decompress(blob, format=lzma.FORMAT_ALONE), "lzma"
         except Exception:
-            return None, "lzma-rusak"
-    if blob[:4] == b"\x28\xb5\x2f\xfd":  # frame zstd (butuh CLI zstd)
+            return None, "lzma-corrupt"
+    if blob[:4] == b"\x28\xb5\x2f\xfd":  
         try:
             r = subprocess.run(["zstd", "-d", "-q"], input=blob,
                                capture_output=True, timeout=30)
@@ -157,7 +130,7 @@ def try_decompress(blob):
         except Exception:
             pass
         return None, "zstd-frame"
-    if blob[:4] == b"\x04\x22\x4d\x18":  # frame lz4
+    if blob[:4] == b"\x04\x22\x4d\x18":  
         try:
             r = subprocess.run(["lz4", "-d", "-q"], input=blob,
                                capture_output=True, timeout=30)
@@ -166,19 +139,12 @@ def try_decompress(blob):
         except Exception:
             pass
         return None, "lz4-frame"
-    return None, "tidak-dikenal"
+    return None, "unknown"
 
-# ------------------------------------------------------- parsing vendor_boot --
-# Layout ground truth (mkbootimg.py lineage-23.0 / A16, little-endian):
-#   magic8 | ver u32 | page u32 | kaddr | rdaddr | vr_size | cmdline[2048]
-#   tags u32 | name[16] | header_size u32 | dtb_size u32 | dtb_addr u64
-#   [v4] tbl_size u32 | num u32 | esize u32 | bootconfig u32   (= 2128 byte)
-# Region: header(page) -> blobs(page) -> dtb(page) -> tabel(page) -> bootconfig
-#   entri 108 byte: size u32, offset u32, type u32, name 32s, board_id 64s
 def parse_vb(path):
     data = open(path, "rb").read()
     if len(data) < 2200:
-        raise ValueError("file terlalu kecil (%d byte) untuk header vendor_boot" % len(data))
+        raise ValueError("file too small (%d bytes) for a vendor_boot header" % len(data))
     h = {"size": len(data), "raw": data}
     h["magic"] = data[:8]
     (h["hdr_ver"], h["page"], h["kaddr"], h["rdaddr"],
@@ -224,8 +190,6 @@ def parse_vb(path):
                     return False
             return True
 
-        # Lokasi tabel: urutan resmi mkbootimg.py = blobs -> dtb -> tabel.
-        # Kandidat alternatif: tabel langsung setelah blobs (antisipasi varian).
         h["tbl_off"], h["tbl_mode"] = tbl_primary, "standar"
         ents = read_table(tbl_primary)
         if not entries_sane(ents):
@@ -240,7 +204,6 @@ def parse_vb(path):
         h["entries"].append({"size": h["vr_size"], "off": 0, "type": 1,
                              "name": "(v3-tunggal)",
                              "blob": data[page:page + h["vr_size"]]})
-    # footer AVB — 64 byte terakhir, SEMUA field BIG-ENDIAN
     foot = data[-64:]
     h["avb"] = None
     if foot[:4] == b"AVBf":
@@ -250,7 +213,6 @@ def parse_vb(path):
                     "vbmeta_off": voff, "vbmeta_size": vsz}
     return h
 
-# --------------------------------------------------------------- pemeriksaan --
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
     path = args[0] if args else None
@@ -258,153 +220,148 @@ def main():
     if not path:
         hits = find_image()
         if not hits:
-            raise SystemExit("vendor_boot.img tidak ditemukan. Salin dulu lalu jalankan:\n"
-                             "  python fox_check_malachite.py /path/ke/vendor_boot.img")
+            raise SystemExit("vendor_boot.img not found. Copy it first, then run:\n"
+                             "  python fox_check_malachite.py /path/to/vendor_boot.img")
         path = extract_from_zip(hits[0]) if hits[0].lower().endswith(".zip") else hits[0]
     elif path.lower().endswith(".zip"):
         path = extract_from_zip(path)
 
-    print("Pemeriksa vendor_boot OrangeFox v3 — %s" % DEV)
+    print("OrangeFox vendor_boot checker v3 — %s" % DEV)
     print("Target: %s" % path)
 
     try:
         h = parse_vb(path)
     except Exception as e:
-        bad("HEADER tidak bisa dibaca: %s" % e)
+        bad("HEADER unreadable: %s" % e)
         verdict(); sys.exit(1)
 
-    # -- 1. identitas file
-    sect(1, "IDENTITAS FILE")
-    info("Ukuran: %d byte (%.2f MiB)" % (h["size"], h["size"] / 1048576.0))
+    sect(1, "FILE IDENTITY")
+    info("Size: %d bytes (%.2f MiB)" % (h["size"], h["size"] / 1048576.0))
     print("  [info] SHA-256: %s" % sha256(path))
-    info("Bandingkan hash ini dengan file di PC (certutil -hashfile vendor_boot.img SHA256) "
-         "untuk memastikan transfer tidak korup.")
+    info("Compare this hash with the file on your PC (certutil -hashfile vendor_boot.img SHA256) "
+         "to make sure the transfer is not corrupted.")
 
-    # -- 2. header
     sect(2, "HEADER VENDOR_BOOT")
     if h["magic"] == b"VNDRBOOT":
-        pok("Magic VNDRBOOT valid — ini image vendor_boot Android")
+        passlog("Magic VNDRBOOT valid — this is an Android vendor_boot image")
     else:
-        bad("Magic salah (%r) — BUKAN image vendor_boot; jangan flash!" % h["magic"])
+        bad("Wrong magic (%r) — NOT a vendor_boot image; do not flash!" % h["magic"])
     if h["hdr_ver"] == EXP_HDR_VER:
-        pok("Header version = %d (sesuai tree malachite)" % h["hdr_ver"])
+        passlog("Header version = %d (matches the malachite tree)" % h["hdr_ver"])
     else:
-        bad("Header version = %d, seharusnya %d — struktur tidak cocok dengan tree" %
+        bad("Header version = %d, expected %d — structure does not match the tree" %
             (h["hdr_ver"], EXP_HDR_VER))
     if h["page"] == EXP_PAGE:
-        pok("Page size = %d (sesuai BOARD_PAGE_SIZE)" % h["page"])
+        passlog("Page size = %d (matches BOARD_PAGE_SIZE)" % h["page"])
     else:
-        bad("Page size = %d, seharusnya %d — image tidak akan bisa boot" %
+        bad("Page size = %d, expected %d — the image will not boot" %
             (h["page"], EXP_PAGE))
     if h["hdr_size"] == EXP_HDR_SIZE:
-        pok("header_size = %d — layout v4 resmi mkbootimg AOSP (ground truth)" % h["hdr_size"])
+        passlog("header_size = %d — official AOSP mkbootimg v4 layout (ground truth)" % h["hdr_size"])
     else:
-        warn("header_size = %d (diharapkan %d) — kemungkinan header v3 atau format lain" %
+        warn("header_size = %d (expected %d) — probably a v3 header or another format" %
              (h["hdr_size"], EXP_HDR_SIZE))
-    info("Kernel: TIDAK ADA di vendor_boot (desain GKI). Kernel tetap dari boot.img stok — "
-         "kompatibilitas kernel terjaga selama boot.img & dtbo tidak disentuh.")
-    info("dtb_size = %d byte @0x%08x | nama board: %r" % (h["dtb_size"], h["dtb_addr"], h["name"]))
+    info("Kernel: NOT PRESENT in vendor_boot (GKI design). The kernel stays in stock boot.img — "
+         "kernel compatibility is preserved as long as boot.img & dtbo are untouched.")
+    info("dtb_size = %d bytes @0x%08x | board name: %r" % (h["dtb_size"], h["dtb_addr"], h["name"]))
     if EXP_CMDLINE.split()[0] in h["cmdline"]:
-        pok("Vendor cmdline berisi token pabrik '%s'" % EXP_CMDLINE.split()[0])
+        passlog("Vendor cmdline contains the factory token '%s'" % EXP_CMDLINE.split()[0])
     else:
-        warn("Vendor cmdline tidak berisi '%s' (isinya: %r)" %
+        warn("Vendor cmdline does not contain '%s' (content: %r)" %
              (EXP_CMDLINE.split()[0], h["cmdline"][:80]))
     if h["vr_size"] <= 0:
-        bad("vendor_ramdisk_size = 0 — ramdisk kosong, image pasti gagal boot")
+        bad("vendor_ramdisk_size = 0 — empty ramdisk, the image will surely fail to boot")
 
-    # -- 3. tabel vendor_ramdisk + pemindaian isi tiap komponen
-    sect(3, "TABEL VENDOR_RAMDISK (komponen di dalam image)")
+    sect(3, "VENDOR_RAMDISK TABLE (components inside the image)")
     scans, rec2, rec_hits = [], [], []
     if h["hdr_ver"] < 4:
-        warn("Header v3 tanpa tabel — komponen tidak bisa diurai per-detail")
+        warn("v3 header without a table — components cannot be parsed in detail")
     elif h["ent_num"] == 0:
-        bad("Tabel vendor_ramdisk kosong (entry_num=0) — bootloader tidak memuat ramdisk apapun!")
+        bad("Empty vendor_ramdisk table (entry_num=0) — the bootloader will load no ramdisk at all!")
     else:
-        info("Tabel @0x%x (%s): %d entri, entry_size %d byte, bootconfig %d byte" %
+        info("Table @0x%x (%s): %d entries, entry_size %d bytes, bootconfig %d bytes" %
              (h.get("tbl_off", 0), h.get("tbl_mode", "standar"),
               h["ent_num"], h["ent_size"], h["bootcfg"]))
         if h["ent_size"] != 108:
-            warn("entry_size = %d (standar AOSP: 108) — layout tidak baku" % h["ent_size"])
+            warn("entry_size = %d (AOSP standard: 108) — non-standard layout" % h["ent_size"])
         for e in h["entries"]:
             nm = TYPE_NAME.get(e["type"], "?%d" % e["type"])
             sc = scan_entry_blob(e["blob"])
             sc["entry"] = e
             scans.append(sc)
             if sc["raw"] is None:
-                ket = "tidak bisa dibuka (%s)" % sc["how"]
+                note = "unopenable (%s)" % sc["how"]
             elif sc["recbin"]:
-                ket = "RECOVERY DITEMUKAN: %s" % ", ".join(sc["recbin"][:2])
+                note = "RECOVERY FOUND: %s" % ", ".join(sc["recbin"][:2])
             else:
-                ket = "%d file, tanpa binary recovery" % sc["nfiles"]
-            info("- %-24s tipe=%-8s ukuran=%-9d isi: %s" %
-                 (e["name"] or "(tanpa nama)", nm, e["size"], ket))
+                note = "%d files, no recovery binary" % sc["nfiles"]
+            info("- %-24s type=%-8s size=%-9d content: %s" %
+                 (e["name"] or "(no name)", nm, e["size"], note))
             if not sc["recbin"]:
-                sc["raw"] = None  # hemat memori: raw hanya disimpan untuk komponen recovery
+                sc["raw"] = None  
         rec_hits = [s for s in scans if s["recbin"]]
         rec2 = [s for s in rec_hits if s["entry"]["type"] == 2]
         if rec2:
-            pok("Komponen RECOVERY ada (%d byte) dan berisi binary recovery — ramdisk recovery tertanam" %
+            passlog("RECOVERY component present (%d bytes) and contains the recovery binary — recovery ramdisk embedded" %
                 rec2[0]["entry"]["size"])
         elif rec_hits:
             e0 = rec_hits[0]["entry"]
             if e0["type"] in (1, 3):
-                pok("Recovery tertanam DI DALAM komponen %s ('%s', %d byte) — DESAIN ASLI tree malachite" %
-                    (TYPE_NAME.get(e0["type"]), e0["name"] or "(tanpa nama)", e0["size"]))
-                info("Tree malachite memakai BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT=true: build system "
-                     "menggabungkan rootfs recovery ke ramdisk PLATFORM, bukan fragment RECOVERY terpisah "
+                passlog("Recovery embedded INSIDE component %s ('%s', %d bytes) — ORIGINAL malachite tree design" %
+                    (TYPE_NAME.get(e0["type"]), e0["name"] or "(no name)", e0["size"]))
+                info("The malachite tree uses BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT=true: the build system "
+                     "merges the recovery rootfs into the PLATFORM ramdisk instead of a separate RECOVERY fragment "
                      "(ground truth: build/make/core/Makefile lineage-23.0, merge TARGET_RECOVERY_ROOT_OUT). "
-                     "Bootloader memuat komponen PLATFORM di SEMUA mode boot — recovery tetap termuat. "
-                     "Tidak adanya entri bertipe RECOVERY itu NORMAL untuk image ini.")
+                     "The bootloader loads the PLATFORM component in ALL boot modes — recovery stays loaded. "
+                     "The absence of a RECOVERY-type entry is NORMAL for this image.")
             else:
-                warn("Binary recovery hanya ada di komponen bertipe NONE — bootloader tidak menjamin memuatnya")
+                warn("The recovery binary lives only in a NONE-typed component — the bootloader does not guarantee loading it")
         elif any(not s["opened"] for s in scans):
             unop = ", ".join(sorted(set(s["how"] for s in scans if not s["opened"])))
-            warn("Binary recovery belum bisa dibuktikan: ada komponen yang tidak terbuka (%s) — "
-                 "jalankan: pkg install lz4 zstd lalu ulangi pemeriksaan" % unop)
+            warn("Recovery binary not yet proven: some component is unopenable (%s) — "
+                 "run: pkg install lz4 zstd then repeat the check" % unop)
         else:
-            bad("Binary 'recovery' TIDAK ditemukan di komponen manapun — image tidak akan bisa boot ke recovery!")
+            bad("The 'recovery' binary was NOT found in any component — the image will not boot to recovery!")
         endmax = max([e["off"] + e["size"] for e in h["entries"]] or [0])
         if endmax == h["vr_size"]:
-            pok("Cakupan entri (%d) = vendor_ramdisk_size — struktur konsisten" % endmax)
+            passlog("Entry coverage (%d) = vendor_ramdisk_size — consistent structure" % endmax)
         elif rec_hits or any(s["nfiles"] > 0 for s in scans):
-            warn("Cakupan entri (%d) != vendor_ramdisk_size (%d) — isi komponen terbaca normal, "
-                 "selisih kemungkinan hanya pembulatan halaman — bukan penghalang" % (endmax, h["vr_size"]))
+            warn("Entry coverage (%d) != vendor_ramdisk_size (%d) — component content reads normally, "
+                 "the gap is probably just page rounding — not a blocker" % (endmax, h["vr_size"]))
         else:
-            bad("Cakupan entri (%d) != vendor_ramdisk_size (%d) — struktur rusak" %
+            bad("Entry coverage (%d) != vendor_ramdisk_size (%d) — broken structure" %
                 (endmax, h["vr_size"]))
 
-    # -- 4. isi ramdisk recovery
-    sect(4, "ISI RAMDISK RECOVERY (bukti OrangeFox tertanam)")
+    sect(4, "RECOVERY RAMDISK CONTENT (proof OrangeFox is embedded)")
     target = rec2[0] if rec2 else (rec_hits[0] if rec_hits else None)
     if target is None:
-        info("Dilewati (tidak ada komponen yang berisi recovery)")
+        info("Skipped (no component contains recovery)")
     elif target["raw"] is None:
-        warn("Komponen recovery terkompresi %s — buka manual dengan: pkg install lz4 lalu ulangi" % target["how"])
+        warn("Recovery component is %s-compressed — open manually with: pkg install lz4 then repeat" % target["how"])
     else:
         raw = target["raw"]
         ents = cpio_entries(raw)
-        info("cpio (%s): %d file" % (target["how"], len(ents)))
+        info("cpio (%s): %d files" % (target["how"], len(ents)))
         names = [n for n, s, m in ents if n != "TRAILER!!!"]
         recbin = [n for n in names if n.endswith("/recovery") or n == "recovery"]
         if recbin:
-            pok("Binary recovery ada: %s" % ", ".join(recbin[:3]))
+            passlog("Recovery binary present: %s" % ", ".join(recbin[:3]))
         else:
-            bad("Tidak menemukan binary 'recovery' di ramdisk")
+            bad("No 'recovery' binary found in the ramdisk")
         if any("init.recovery" in n for n in names):
-            pok("init.recovery*.rc ada (skrip boot recovery)")
+            passlog("init.recovery*.rc present (recovery boot scripts)")
         else:
-            warn("init.recovery*.rc tidak terlihat")
-        info("File res/ (tema/gambar UI): %d" % target["res"])
+            warn("init.recovery*.rc not visible")
+        info("res/ files (UI themes/images): %d" % target["res"])
         if b"OrangeFox" in raw:
-            pok("String 'OrangeFox' ditemukan — build benar OrangeFox, bukan TWRP murni")
+            passlog("String 'OrangeFox' found — genuinely an OrangeFox build, not pure TWRP")
         else:
-            warn("String 'OrangeFox' tidak ditemukan di ramdisk (aneh untuk build ini)")
+            warn("String 'OrangeFox' not found in the ramdisk (odd for this build)")
         if b"VikrieGunawan" in raw:
-            pok("Maintainer 'VikrieGunawan' tertanam di binary")
+            passlog("Maintainer 'VikrieGunawan' embedded in the binary")
         else:
-            info("Maintainer tidak terbaca (boleh diabaikan)")
+            info("Maintainer unreadable (safe to ignore)")
 
-    # -- 5. AVB / vbmeta (BIG-ENDIAN)
     sect(5, "FOOTER AVB / VBMETA (big-endian)")
     if h["avb"]:
         a = h["avb"]
@@ -412,109 +369,106 @@ def main():
                 and 0 < a["vbmeta_off"] <= h["size"]
                 and a["vbmeta_off"] + a["vbmeta_size"] <= h["size"])
         if sane:
-            pok("Footer AVBf v%d.%d valid (orig_size=%d, vbmeta@%d)" %
+            passlog("Footer AVBf v%d.%d valid (orig_size=%d, vbmeta@%d)" %
                 (a["vmaj"], a["vmin"], a["orig_size"], a["vbmeta_off"]))
             vb = h["raw"][a["vbmeta_off"]:a["vbmeta_off"] + a["vbmeta_size"]]
             if vb[:4] == b"AVB0":
-                pok("Blob vbmeta AVB0 valid")
+                passlog("Blob vbmeta AVB0 valid")
                 if b"vendor_boot" in vb[:4096]:
-                    pok("Deskriptor hash untuk partisi 'vendor_boot' ada")
+                    passlog("Hash descriptor for partition 'vendor_boot' present")
                 else:
-                    warn("Nama partisi 'vendor_boot' tidak terlihat di vbmeta")
+                    warn("Partition name 'vendor_boot' not visible in vbmeta")
                 algo = struct.unpack_from(">I", vb, 28)[0] if len(vb) >= 32 else -1
-                info("Algorithm type AVB: %d (0=tanpa tanda tangan; bootloader terbuka tetap boot)" % algo)
+                info("AVB algorithm type: %d (0=unsigned; unlocked bootloader still boots)" % algo)
             else:
-                warn("vbmeta_offset tidak menunjuk blob AVB0")
+                warn("vbmeta_offset does not point to an AVB0 blob")
         else:
-            warn("Footer AVBf ada tetapi field di luar batas file — "
-                 "tidak fatal di bootloader terbuka; hexdump: %s" % h["raw"][-64:].hex()[:96])
+            warn("AVBf footer present but fields out of file bounds — "
+                 "not fatal on an unlocked bootloader; hexdump: %s" % h["raw"][-64:].hex()[:96])
     else:
-        warn("Tidak ada footer AVB — wajar di-bootloader terbuka, tapi tidak standar untuk build GKI")
+        warn("No AVB footer — normal on an unlocked bootloader, but not standard for GKI builds")
 
-    # -- 6. kecocokan partisi
-    sect(6, "KECOCOKAN PARTISI HP")
+    sect(6, "PHONE PARTITION MATCH")
     if h["size"] <= EXP_PART_SIZE:
-        pok("Ukuran image %.2f MiB <= partisi vendor_boot 64 MiB (67108864 byte)" %
+        passlog("Image size %.2f MiB <= vendor_boot partition 64 MiB (67108864 bytes)" %
             (h["size"] / 1048576.0))
     else:
-        bad("Image %.2f MiB MELEBIHI partisi 64 MiB — flash bisa gagal/menulis melenceng!" %
+        bad("Image %.2f MiB EXCEEDS the 64 MiB partition — flash may fail/write out of bounds!" %
             (h["size"] / 1048576.0))
     if h["size"] == EXP_PART_SIZE:
-        info("Ukuran persis 64 MiB = normal: avbtool mem-pad image ke ukuran partisi.")
+        info("Exactly 64 MiB = normal: avbtool pads the image to partition size.")
     real = part_size_sysfs()
     if real:
         if real == EXP_PART_SIZE:
-            pok("Partisi vendor_boot HP terbaca: %d byte = sama dengan nilai tree" % real)
+            passlog("Phone vendor_boot partition reads: %d bytes = same as the tree value" % real)
         else:
-            warn("Partisi vendor_boot HP terbaca: %d byte (tree: %d) — pastikan ini benar-benar malachite" % (real, EXP_PART_SIZE))
+            warn("Phone vendor_boot partition reads: %d bytes (tree: %d) — make sure this is really a malachite" % (real, EXP_PART_SIZE))
     else:
-        info("Ukuran partisi tidak bisa dibaca tanpa root — dipakai nilai tree 67108864")
+        info("Partition size unreadable without root — using the tree value 67108864")
 
-    # -- 7. kondisi HP
-    sect(7, "KONDISI HP (getprop)")
+    sect(7, "PHONE STATE (getprop)")
     dev = getprop("ro.product.device")
     if dev is None:
-        warn("getprop tidak tersedia — bagian ini dilewati")
+        warn("getprop unavailable — section skipped")
     else:
         if dev == DEV:
-            pok("Perangkat = %s (cocok)" % dev)
+            passlog("Device = %s (match)" % dev)
         else:
-            bad("Perangkat = %s — BUKAN %s! Nilai patokan tidak berlaku, jangan flash!" % (dev, DEV))
+            bad("Device = %s — NOT %s! Reference values do not apply, do not flash!" % (dev, DEV))
         rel = getprop("ro.build.version.release") or "?"
         inc = getprop("ro.build.version.incremental") or "?"
         info("Android %s | firmware: %s" % (rel, inc))
         if EXP_FIRMWARE not in inc:
-            warn("Firmware bukan %s (target build) — recovery tetap bisa dicoba, tapi dekripsi data belum tentu" % EXP_FIRMWARE)
+            warn("Firmware is not %s (target build) — recovery may still work, but data decryption is not guaranteed" % EXP_FIRMWARE)
         locked = getprop("ro.boot.flash.locked")
         vbs = getprop("ro.boot.verifiedbootstate")
         if locked == "0":
-            pok("Bootloader TERBUKA (flash.locked=0)")
+            passlog("Bootloader UNLOCKED (flash.locked=0)")
         elif locked == "1" and vbs == "green":
-            warn("flash.locked=1 & verifiedbootstate=green — BISA JADI hasil spoof (UBL nyata). "
-                 "Nilai userspace tidak bisa dipercaya; verifikasi dari PC: fastboot getvar unlocked "
-                 "(harus 'yes'). Flash hanya ditolak bila bootloader benar-benar terkunci.")
+            warn("flash.locked=1 & verifiedbootstate=green — MAY BE a spoof result (real UBL). "
+                 "Userspace values cannot be trusted; verify from a PC: fastboot getvar unlocked "
+                 "(must be 'yes'). Flash is refused only when the bootloader is truly locked.")
         elif locked == "1":
-            warn("flash.locked=1 — jika UBL-nya dispoof abaikan; jika tidak, flash akan ditolak.")
+            warn("flash.locked=1 — ignore if UBL is spoofed; otherwise flash will be refused.")
         else:
-            info("Status bootloader tidak terbaca (%r)" % locked)
-        info("verifiedbootstate = %s | Slot aktif: %r | kernel berjalan: %s" %
+            info("Bootloader status unreadable (%r)" % locked)
+        info("verifiedbootstate = %s | Active slot: %r | running kernel: %s" %
              (vbs, getprop("ro.boot.slot_suffix"),
               subprocess.run(["uname", "-r"], capture_output=True, text=True).stdout.strip()))
-        info("vendor_boot TIDAK menyentuh kernel — boot.img, dtbo, vbmeta, super tidak diubah saat flash vendor_boot saja")
+        info("vendor_boot does NOT touch the kernel — boot.img, dtbo, vbmeta, super stay unchanged when flashing vendor_boot only")
 
-    # -- 8. pembanding stok
     if stock:
-        sect(8, "PEMBANDING VENDOR_BOOT STOK")
+        sect(8, "STOCK VENDOR_BOOT COMPARISON")
         try:
             s = parse_vb(stock)
-            print("  [info] Stok: SHA-256 %s" % sha256(stock))
+            print("  [info] Stock: SHA-256 %s" % sha256(stock))
             if s["magic"] != b"VNDRBOOT":
-                bad("File stok bukan vendor_boot")
+                bad("Stock file is not a vendor_boot")
             else:
                 same = (s["hdr_ver"] == h["hdr_ver"] and s["page"] == h["page"])
                 if same:
-                    pok("Header version & page size STOK = HASIL BUILD (%d / %d) — kompatibel" %
+                    passlog("STOCK header version & page size = BUILD RESULT (%d / %d) — compatible" %
                         (h["hdr_ver"], h["page"]))
                 else:
-                    bad("Header/page stok (%d/%d) BEDA dengan hasil build (%d/%d) — JANGAN flash!" %
+                    bad("Stock header/page (%d/%d) DIFFERS from the build result (%d/%d) — DO NOT flash!" %
                         (s["hdr_ver"], s["page"], h["hdr_ver"], h["page"]))
-                info("Simpan vendor_boot stok ini sebagai cadangan rollback: "
+                info("Keep this stock vendor_boot as a rollback backup: "
                      "fastboot flash vendor_boot vendor_boot_stok.img")
         except Exception as e:
-            warn("Stok tidak bisa dianalisa: %s" % e)
+            warn("Stock cannot be analyzed: %s" % e)
 
     verdict()
 
 def verdict():
     print("\n" + "=" * 64)
-    print("RINGKASAN: PASS=%d  WARN=%d  FAIL=%d" % (len(PASS), len(WARN), len(FAIL)))
+    print("SUMMARY: PASS=%d  WARN=%d  FAIL=%d" % (len(PASS), len(WARN), len(FAIL)))
     if FAIL:
-        print("KEPUTUSAN: JANGAN FLASH DULU — selesaikan dulu butir FAIL di atas.")
-        print("Kirim output ini ke assistant untuk dianalisa.")
+        print("DECISION: DO NOT FLASH YET — resolve the FAIL items above first.")
+        print("Send this output to the assistant for analysis.")
     else:
-        print("KEPUTUSAN: STRUKTUR IMAGE SEHAT — aman lanjut ke tahap flash.")
-        print("Wajib siapkan: vendor_boot.img STOK (dari fastboot ROM 2.0.208.0.VOOMIXM)")
-        print("Rollback satu perintah: fastboot flash vendor_boot vendor_boot_stok.img")
+        print("DECISION: IMAGE STRUCTURE HEALTHY — safe to proceed to flashing.")
+        print("Required: STOCK vendor_boot.img (from the fastboot ROM 2.0.208.0.VOOMIXM)")
+        print("One-command rollback: fastboot flash vendor_boot vendor_boot_stok.img")
     print("=" * 64)
     sys.exit(1 if FAIL else 0)
 
@@ -524,5 +478,5 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as e:
-        print("Kesalahan tak terduga: %r" % e)
+        print("Unexpected error: %r" % e)
         sys.exit(1)
