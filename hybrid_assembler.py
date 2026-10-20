@@ -1,47 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-hybrid_assembler.py v2 — Rakit vendor_boot HYBRID malachite
-(Xiaomi Redmi Note 14 Pro 5G · HyperOS 2.0.208.0.VOOMIXM · Android 15 · GKI vendor_boot v4)
-
-Prinsip (koreksi atas v1 yang gagal "fragment recovery terlalu besar utk 64 MiB"):
-  1. Ramdisk NORMAL stok (entri PLATFORM/DLKM/NONE) dipertahankan BYTE-PERSIS di
-     offset aslinya -> boot normal tidak tersentuh.
-  2. BLOB entri RECOVERY stok (type-2) DIGANTI dengan ramdisk OrangeFox — entri
-     dipakai ulang (jumlah entri tetap, byte entri custom 44..ent_size dipertahankan).
-     Ini komposisi yang dibuktikan bootloader stok (recovery stok bekerja).
-  3. Kompresi fragmen otomatis zstd-19 -> xz-9 -> lzma-9 -> gzip-9: ambil codec
-     pertama yang MUAT di partisi. Kernel GKI android15-6.6 usr/Kconfig: RD_GZIP /
-     RD_LZMA / RD_XZ / RD_LZO / RD_LZ4 / RD_ZSTD semua "default y", dan fragmen
-     RECOVERY hanya dimuat saat boot recovery -> gagal dekompresi tidak menyentuh
-     boot normal (mode gagal-aman).
-  4. Kalau tetap tidak muat: blob stok yang dipertahankan ikut dikompres ulang
-     (--recompress-stock auto|force). Anggaran per bagian dilaporkan + laporan JSON
-     + verifikasi mandiri penuh.
-
-Layout ground truth (mkbootimg.py lineage-23.0/AOSP main, tervalidasi lapangan):
-  header v4 = 2128 B: vr_size@24 | cmdline@28 | tags@2076 | name@2080 |
-  hdr_size@2096 | dtb_size@2100 | dtb_addr@2104 | tbl_size@2112 | ent_num@2116 |
-  ent_size@2120 | bootcfg@2124. Region: header(page) -> blobs -> dtb -> tabel ->
-  bootconfig. Entri = 108 B: size@0, offset@4 (rel. thd awal region blob),
-  type@8, name32@12, board_id 16xu32@44. Footer AVBf = BIG-ENDIAN (dibuang di output).
-
-Pemakaian (GitHub Actions maupun lokal/Termux):
-  python3 hybrid_assembler.py \
-      --stock    vendor_boot_stock.img \
-      --fragment vendor_boot.img.recovery.cpio.gz \
-      --output   OrangeFox-R12.0_0-Beta-vendor_boot.img \
-      --partition-size 67108864 --avb-headroom 8192 \
-      --report   assemble_report.json
-
-  --codec zstd|xz|lzma|gzip   paksa codec (default: auto = codec pertama yang muat)
-  --recompress-stock auto|never|force   (default auto: hanya bila perlu)
-  --keep-stock-recovery       jangan ganti entri RECOVERY stok; Fox ditambah sebagai
-                              entri type-2 baru (butuh ruang lebih besar)
-  --dry-run                   hitung & lapangkan anggaran tanpa menulis output
-Stdlib Python saja; opsi zstd memakai CLI `zstd` bila tersedia (runner GitHub sudah
-memilikinya; Termux: pkg install zstd xz-utils lz4).
-"""
 from __future__ import annotations
 
 import argparse
@@ -61,12 +17,10 @@ MAGIC_VB = b"VNDRBOOT"
 MAGIC_DTB = b"\xd0\x0d\xfe\xed"
 HDR_V4_SIZE = 2128
 
-# ---- offset field header vendor_boot v4 (little-endian) ----
 OFF_VER, OFF_PAGE, OFF_KADDR, OFF_RDADDR, OFF_VRSIZE = 8, 12, 16, 20, 24
 OFF_TAGS, OFF_NAME, OFF_HDRSIZE, OFF_DTBSIZE, OFF_DTBADDR = 2076, 2080, 2096, 2100, 2104
 OFF_TBLSIZE, OFF_ENTNUM, OFF_ENTSIZE, OFF_BOOTCFG = 2112, 2116, 2120, 2124
 
-# ---- offset field entri tabel (V4: 108 byte) ----
 E_SIZE, E_OFF, E_TYPE, E_NAME, E_BOARD = 0, 4, 8, 12, 44
 MIN_ENT_SIZE = 44
 
@@ -78,30 +32,21 @@ MAGIC_ZSTD = b"\x28\xb5\x2f\xfd"
 MAGIC_XZ = b"\xfd7zXZ\x00"
 MAGIC_LZ4 = b"\x04\x22\x4d\x18"
 
-
 class AsmError(Exception):
-    """Kesalahan fatal yang harus dilaporkan apa adanya ke user/CI."""
-
+    pass
 
 def align(x: int, p: int) -> int:
     return (x + p - 1) // p * p
 
-
 def fmt(n: int) -> str:
     return format(n, ",")
-
 
 def mib(n: float) -> str:
     return "%.2f MiB" % (n / 1048576.0)
 
-
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
-
-# --------------------------------------------------------------------------- #
-#  Deteksi & dekompresi kontainer
-# --------------------------------------------------------------------------- #
 def sniff(blob: bytes) -> str:
     if blob[:2] == MAGIC_GZ:
         return "gzip"
@@ -115,8 +60,7 @@ def sniff(blob: bytes) -> str:
         return "lzma"
     if blob[:6] in (b"070701", b"070702"):
         return "cpio-mentah"
-    return "tidak-dikenal"
-
+    return "unknown"
 
 def _run_cli(cmd, data: bytes, timeout: int = 600):
     try:
@@ -127,70 +71,58 @@ def _run_cli(cmd, data: bytes, timeout: int = 600):
         return r.stdout
     return None
 
-
 def decompress_any(blob: bytes):
-    """-> (raw | None, cara). Mendukung gzip/xz/lzma (stdlib) + zstd/lz4 (CLI)."""
+    pass
     kind = sniff(blob)
     if kind == "gzip":
         try:
             return gzip.decompress(blob), "gzip"
         except Exception:
-            return None, "gzip-rusak"
+            return None, "gzip-corrupt"
     if kind == "xz":
         try:
             return lzma.decompress(blob), "xz"
         except Exception:
-            return None, "xz-rusak"
+            return None, "xz-corrupt"
     if kind == "lzma":
         try:
             return lzma.decompress(blob, format=lzma.FORMAT_ALONE), "lzma"
         except Exception:
-            return None, "lzma-rusak"
+            return None, "lzma-corrupt"
     if kind == "zstd":
         out = _run_cli(["zstd", "-d", "-q"], blob)
         if out is None and shutil.which("unzstd"):
             out = _run_cli(["unzstd", "-q"], blob)
-        return (out, "zstd") if out is not None else (None, "zstd-tak-terbuka")
+        return (out, "zstd") if out is not None else (None, "zstd-unopenable")
     if kind == "lz4":
         out = _run_cli(["lz4", "-d", "-q"], blob)
-        return (out, "lz4") if out is not None else (None, "lz4-tak-terbuka")
+        return (out, "lz4") if out is not None else (None, "lz4-unopenable")
     if kind == "cpio-mentah":
         return blob, "cpio-mentah"
     return None, kind
 
-
-# --------------------------------------------------------------------------- #
-#  Kompresor
-# --------------------------------------------------------------------------- #
 def _comp_gzip(data: bytes) -> bytes:
     return gzip.compress(data, compresslevel=9, mtime=0)
 
-
 def _comp_xz(data: bytes) -> bytes:
-    # Utamakan CLI xz multithread (jauh lebih cepat di CI; keluaran tetap .xz
-    # standar yang bisa dibaca dekompresor kernel — multi-block didukung).
     if shutil.which("xz"):
         out = _run_cli(["xz", "-T0", "-9", "--check=crc32", "-q"], data)
         if out is not None:
             return out
-    # Fallback stdlib: preset 9 (tanpa EXTREME — rasio beda <0,5%, waktu ~2x lebih cepat).
     return lzma.compress(data, format=lzma.FORMAT_XZ,
                          preset=9, check=lzma.CHECK_CRC32)
-
 
 def _comp_lzma(data: bytes) -> bytes:
     return lzma.compress(data, format=lzma.FORMAT_ALONE, preset=9)
 
-
 def _comp_zstd(data: bytes) -> bytes:
     out = _run_cli(["zstd", "-19", "-T0", "-q"], data)
     if out is None:
-        raise AsmError("zstd gagal (CLI ada tetapi kompresi error)")
+        raise AsmError("zstd failed (CLI present but compression errored)")
     return out
 
-
 def codec_list() -> list:
-    """Urutan preferensi: rasio & kecepatan dekompresi kernel."""
+    pass
     out = []
     if shutil.which("zstd"):
         out.append(("zstd", _comp_zstd))
@@ -199,40 +131,36 @@ def codec_list() -> list:
     out.append(("gzip", _comp_gzip))
     return out
 
-
-# --------------------------------------------------------------------------- #
-#  Parser vendor_boot v4
-# --------------------------------------------------------------------------- #
 def parse_vb(data: bytes, label: str) -> dict:
     if len(data) < 2200:
-        raise AsmError("%s: terlalu kecil (%d B) untuk vendor_boot" % (label, len(data)))
+        raise AsmError("%s: too small (%d B) for a vendor_boot" % (label, len(data)))
     if data[:8] != MAGIC_VB:
-        raise AsmError("%s: magic %r bukan VNDRBOOT (bukan vendor_boot AOSP)" % (label, data[:8]))
+        raise AsmError("%s: magic %r is not VNDRBOOT (not an AOSP vendor_boot)" % (label, data[:8]))
     h = {"label": label, "file_size": len(data)}
     (h["ver"], h["page"], h["kaddr"], h["rdaddr"],
      h["vr_size"]) = struct.unpack_from("<5I", data, OFF_VER)
     if h["ver"] != 4:
-        raise AsmError("%s: header_version=%d — assembler ini hanya menangani v4" % (label, h["ver"]))
+        raise AsmError("%s: header_version=%d — this assembler handles v4 only" % (label, h["ver"]))
     h["hdr_size"] = struct.unpack_from("<I", data, OFF_HDRSIZE)[0]
     h["dtb_size"] = struct.unpack_from("<I", data, OFF_DTBSIZE)[0]
     h["dtb_addr"] = struct.unpack_from("<Q", data, OFF_DTBADDR)[0]
     h["tbl_size"], h["ent_num"], h["ent_size"], h["bootcfg"] = \
         struct.unpack_from("<IIII", data, OFF_TBLSIZE)
     if h["hdr_size"] != HDR_V4_SIZE:
-        raise AsmError("%s: header_size=%d (diharapkan %d) — layout tidak dikenal"
+        raise AsmError("%s: header_size=%d (expected %d) — unknown layout"
                        % (label, h["hdr_size"], HDR_V4_SIZE))
     if h["ent_size"] < MIN_ENT_SIZE:
-        raise AsmError("%s: entry_size=%d terlalu kecil (<%d)" % (label, h["ent_size"], MIN_ENT_SIZE))
+        raise AsmError("%s: entry_size=%d too small (<%d)" % (label, h["ent_size"], MIN_ENT_SIZE))
     h["cmdline"] = data[28:28 + 2048].split(b"\x00")[0].decode("utf-8", "replace")
     h["board"] = data[OFF_NAME:OFF_NAME + 16].split(b"\x00")[0].decode("utf-8", "replace")
 
     page = h["page"]
     blob_base = page
     dtb_abs = align(blob_base + h["vr_size"], page)
-    tbl_abs_std = align(dtb_abs + h["dtb_size"], page)   # resmi: blobs -> dtb -> tabel
-    tbl_abs_alt = align(blob_base + h["vr_size"], page)  # varian: tabel langsung stlh blobs
+    tbl_abs_std = align(dtb_abs + h["dtb_size"], page)   
+    tbl_abs_alt = align(blob_base + h["vr_size"], page)  
 
-    def baca_tabel(off):
+    def read_table(off):
         ents = []
         if off < page or off + h["tbl_size"] > len(data):
             return None
@@ -249,7 +177,7 @@ def parse_vb(data: bytes, label: str) -> dict:
                          "type": etype, "name": nm, "raw": raw})
         return ents
 
-    def masuk_akal(ents):
+    def plausible(ents):
         if not ents:
             return False
         for e in ents:
@@ -261,25 +189,25 @@ def parse_vb(data: bytes, label: str) -> dict:
                 return False
         return True
 
-    ents, mode = baca_tabel(tbl_abs_std), "standar"
-    if not masuk_akal(ents) and tbl_abs_alt != tbl_abs_std:
-        e2 = baca_tabel(tbl_abs_alt)
-        if masuk_akal(e2):
+    ents, mode = read_table(tbl_abs_std), "standar"
+    if not plausible(ents) and tbl_abs_alt != tbl_abs_std:
+        e2 = read_table(tbl_abs_alt)
+        if plausible(e2):
             ents, mode = e2, "alternatif"
-    if not masuk_akal(ents):
-        raise AsmError("%s: tabel vendor_ramdisk tidak valid (tbl=%d, num=%d, esize=%d)"
+    if not plausible(ents):
+        raise AsmError("%s: invalid vendor_ramdisk table (tbl=%d, num=%d, esize=%d)"
                        % (label, h["tbl_size"], h["ent_num"], h["ent_size"]))
     if h["tbl_size"] != h["ent_num"] * h["ent_size"]:
-        _warn("%s: tbl_size=%d != ent_num*ent_size=%d (dilanjutkan dengan angka tabel)"
+        _warn("%s: tbl_size=%d != ent_num*ent_size=%d (continuing with the table values)"
               % (label, h["tbl_size"], h["ent_num"] * h["ent_size"]))
 
     for e in ents:
         b = data[blob_base + e["off"]: blob_base + e["off"] + e["size"]]
         if len(b) != e["size"]:
-            raise AsmError("%s: blob entri[%d] '%s' keluar batas file" % (label, e["idx"], e["name"]))
+            raise AsmError("%s: entry[%d] blob '%s' out of file bounds" % (label, e["idx"], e["name"]))
         e["blob"] = b
         e["kompresi"] = sniff(b)
-    h["entries"] = ents
+    h["entrieses"] = ents
     h["tbl_abs"] = tbl_abs_std if mode == "standar" else tbl_abs_alt
     h["tbl_mode"] = mode
     h["dtb"] = data[dtb_abs:dtb_abs + h["dtb_size"]] if h["dtb_size"] else b""
@@ -288,7 +216,6 @@ def parse_vb(data: bytes, label: str) -> dict:
     h["header_page"] = bytes(data[:page])
     h["avb"] = _avb_footer(data)
     return h
-
 
 def _avb_footer(data: bytes):
     foot = data[-64:]
@@ -299,14 +226,8 @@ def _avb_footer(data: bytes):
     return {"vmaj": vmaj, "vmin": vmin, "orig_size": orig,
             "vbmeta_off": voff, "vbmeta_size": vsz}
 
-
-# --------------------------------------------------------------------------- #
-#  Anggaran ukuran
-# --------------------------------------------------------------------------- #
-def hitung_layout(page, kept_end, fox_size, dtb_size, tbl_size, bootcfg_size):
-    """-> (total, fox_off_rel, vr_size) untuk satu komposisi blob.
-    total = panjang image final TERMASUK padding halaman terakhir (bootconfig
-    ditulis ter-pad, persis perilaku mkbootimg write_padded_file)."""
+def compute_layout(page, kept_end, fox_size, dtb_size, tbl_size, bootcfg_size):
+    pass
     fox_off = align(kept_end, page)
     vr = fox_off + fox_size
     dtb_abs = align(page + vr, page)
@@ -314,10 +235,6 @@ def hitung_layout(page, kept_end, fox_size, dtb_size, tbl_size, bootcfg_size):
     bcfg_abs = align(tbl_abs + tbl_size, page)
     return align(bcfg_abs + bootcfg_size, page), fox_off, vr
 
-
-# --------------------------------------------------------------------------- #
-#  Util entri
-# --------------------------------------------------------------------------- #
 def patch_entry(raw: bytearray, size: int, off: int, etype=None, name=None, zero_board=False):
     struct.pack_into("<III", raw, E_SIZE, size, off, etype if etype is not None
                      else struct.unpack_from("<I", raw, E_TYPE)[0])
@@ -330,16 +247,14 @@ def patch_entry(raw: bytearray, size: int, off: int, etype=None, name=None, zero
         raw[E_BOARD:] = b"\x00" * (len(raw) - E_BOARD)
     return raw
 
-
-def rekompress_kept(kept, codec_name, comp_fn):
-    """Kembalikan (kept_baru, catatan). Blob didekompres lalu dikompres ulang;
-    offset dihitung ulang berurutan tanpa jeda (gaya mkbootimg)."""
-    baru, cat, off = [], [], 0
+def recompress_kept(kept, codec_name, comp_fn):
+    pass
+    new, cat, off = [], [], 0
     for e in kept:
         raw_content, how = decompress_any(e["blob"])
         entry = dict(e)
         if raw_content is None:
-            cat.append("entri[%d] '%s' tidak bisa dibuka (%s) — dipertahankan apa adanya"
+            cat.append("entry[%d] '%s' unopenable (%s) — kept as-is"
                        % (e["idx"], e["name"] or "?", how))
             nb = e["blob"]
         else:
@@ -353,237 +268,216 @@ def rekompress_kept(kept, codec_name, comp_fn):
         entry["blob"], entry["raw"], entry["off"], entry["size"] = nb, raw, off, len(nb)
         entry["kompresi"] = sniff(nb)
         off += len(nb)
-        baru.append(entry)
-    return baru, cat
+        new.append(entry)
+    return new, cat
 
-
-# --------------------------------------------------------------------------- #
-#  Verifikasi mandiri
-# --------------------------------------------------------------------------- #
-def verifikasi(out: bytes, stok: dict, kept_asli: list, skema_mode: str,
-               fox_raw_ent: bytes, fox_blob: bytes, cpio_asli: bytes):
-    """kept_asli = entri stok ASLI (sebelum rekompresi) utk pembanding isi."""
+def verify(out: bytes, stock_img: dict, kept_orig: list, schema_mode: str,
+               fox_raw_ent: bytes, fox_blob: bytes, cpio_orig: bytes):
+    pass
     v = parse_vb(out, "output")
-    ket = []
+    note = []
 
-    def cek(kondisi, pesan):
-        if not kondisi:
-            raise AsmError("verifikasi GAGAL: " + pesan)
-        ket.append("[OK] " + pesan)
+    def chk(cond, msg):
+        if not cond:
+            raise AsmError("verification FAILED: " + msg)
+        note.append("[OK] " + msg)
 
-    cek(v["ver"] == stok["ver"] and v["page"] == stok["page"], "ver/page size sama dengan stok")
+    chk(v["ver"] == stock_img["ver"] and v["page"] == stock_img["page"], "ver/page size identical to stock")
     for f in ("kaddr", "rdaddr", "cmdline", "board", "hdr_size", "dtb_size", "dtb_addr",
               "ent_size", "bootcfg"):
-        cek(v[f] == stok[f], "header.%s dipertahankan (%s)" % (f, fmt(v[f]) if isinstance(v[f], int) else v[f]))
-    cek(v["vr_size"] == max([e["off"] + e["size"] for e in v["entries"]] or [0]),
-        "vr_size %s = ujung blob terakhir" % fmt(v["vr_size"]))
-    cek(v["ent_num"] == len(kept_asli) + 1, "ent_num=%d (stok dipertahankan + 1 entri Fox)" % v["ent_num"])
+        chk(v[f] == stock_img[f], "header.%s kept (%s)" % (f, fmt(v[f]) if isinstance(v[f], int) else v[f]))
+    chk(v["vr_size"] == max([e["off"] + e["size"] for e in v["entrieses"]] or [0]),
+        "vr_size %s = end of the last blob" % fmt(v["vr_size"]))
+    chk(v["ent_num"] == len(kept_orig) + 1, "ent_num=%d (stock kept + 1 Fox entry)" % v["ent_num"])
 
-    for i, asli in enumerate(kept_asli):
-        e = v["entries"][i]
-        cek(e["type"] == asli["type"] and e["name"] == asli["name"],
-            "entri[%d] '%s' %s dipertahankan (tipe+nama)" % (i, asli["name"] or "?", TYPE_LABEL[asli["type"]]))
-        if skema_mode == "as-is":
-            cek(e["blob"] == asli["blob"], "entri[%d] blob byte-persis stok (%s B)"
-                % (i, fmt(asli["size"])))
+    for i, orig in enumerate(kept_orig):
+        e = v["entrieses"][i]
+        chk(e["type"] == orig["type"] and e["name"] == orig["name"],
+            "entry[%d] '%s' %s kept (type+name)" % (i, orig["name"] or "?", TYPE_LABEL[orig["type"]]))
+        if schema_mode == "as-is":
+            chk(e["blob"] == orig["blob"], "entry[%d] blob byte-exact from stock (%s B)"
+                % (i, fmt(orig["size"])))
         else:
-            a_raw, _ = decompress_any(asli["blob"])
+            a_raw, _ = decompress_any(orig["blob"])
             b_raw, how = decompress_any(e["blob"])
-            cek(a_raw is not None and a_raw == b_raw,
-                "entri[%d] ISI sama dgn stok asli (dikompres ulang %s: %s -> %s B)"
-                % (i, how, fmt(asli["size"]), fmt(e["size"])))
-    fox = v["entries"][-1]
-    cek(bytes(fox["raw"]) == bytes(fox_raw_ent), "entri Fox memakai byte entri RECOVERY stok (dengan size/offset baru)")
-    cek(fox["type"] == TYPE_RECOVERY, "entri Fox bertipe RECOVERY (2) — dimuat bootloader saat mode recovery")
-    cek(fox["blob"] == fox_blob, "entri Fox = blob OrangeFox yang baru (%s B)" % fmt(len(fox_blob)))
+            chk(a_raw is not None and a_raw == b_raw,
+                "entry[%d] CONTENT identical to original stock (recompressed %s: %s -> %s B)"
+                % (i, how, fmt(orig["size"]), fmt(e["size"])))
+    fox = v["entrieses"][-1]
+    chk(bytes(fox["raw"]) == bytes(fox_raw_ent), "Fox entry reuses stock RECOVERY entry bytes (with new size/offset)")
+    chk(fox["type"] == TYPE_RECOVERY, "Fox entry is RECOVERY-typed (2) — loaded by the bootloader in recovery mode")
+    chk(fox["blob"] == fox_blob, "Fox entry = fresh OrangeFox blob (%s B)" % fmt(len(fox_blob)))
     dec, how = decompress_any(fox["blob"])
-    cek(dec == cpio_asli, "blob Fox didekompres balik (%s) = cpio asli %s B" % (how, fmt(len(cpio_asli))))
-    cek(v["dtb"] == stok["dtb"], "DTB byte-persis stok (%s B)" % fmt(stok["dtb_size"]))
-    cek(v["bootcfg_bytes"] == stok["bootcfg_bytes"], "bootconfig dipertahankan (%s B)" % fmt(stok["bootcfg"]))
-    cek(v["avb"] is None, "footer AVB lama dibuang (tinggal avbtool/pipeline menambah ulang)")
-    return v, ket
+    chk(dec == cpio_orig, "Fox blob decompressed back (%s) = original cpio %s B" % (how, fmt(len(cpio_orig))))
+    chk(v["dtb"] == stock_img["dtb"], "DTB byte-exact from stock (%s B)" % fmt(stock_img["dtb_size"]))
+    chk(v["bootcfg_bytes"] == stock_img["bootcfg_bytes"], "bootconfig kept (%s B)" % fmt(stock_img["bootcfg"]))
+    chk(v["avb"] is None, "old AVB footer dropped (avbtool/pipeline will re-add it)")
+    return v, note
 
-
-# --------------------------------------------------------------------------- #
-#  Util kecil
-# --------------------------------------------------------------------------- #
 _WARNINGS = []
-
 
 def _warn(m):
     _WARNINGS.append(m)
     print("  [!] " + m)
 
-
-def muat_fragment(path):
+def load_fragment(path):
     blob = open(path, "rb").read()
     kind = sniff(blob)
     raw, how = decompress_any(blob)
     if raw is None:
-        raise AsmError("fragment %s tidak bisa dibuka (%s). Untuk lz4/zstd di Termux: "
+        raise AsmError("fragment %s unopenable (%s). For lz4/zstd in Termux: "
                        "pkg install lz4 zstd xz-utils" % (path, kind))
     if raw[:6] not in (b"070701", b"070702"):
         i = raw.find(b"070701", 0, 4096)
         if i < 0:
-            raise AsmError("fragment %s bukan arsip cpio (deteksi: %s). Kirim cpio mentah "
-                           "atau .gz/.xz/.zst dari ramdisk recovery." % (path, how))
+            raise AsmError("fragment %s is not a cpio archive (detection: %s). Provide a raw cpio "
+                           "or .gz/.xz/.zst of the recovery ramdisk." % (path, how))
         raw = raw[i:]
     return raw, kind, how
 
-
-def dump_entri(h):
-    for e in h["entries"]:
+def dump_entry(h):
+    for e in h["entrieses"]:
         print("    [%d] %-18s %-8s %12s B  off=%-9d  isi=%s" %
-              (e["idx"], e["name"] or "(tanpa-nama)", TYPE_LABEL.get(e["type"], "?"),
+              (e["idx"], e["name"] or "(no-name)", TYPE_LABEL.get(e["type"], "?"),
                fmt(e["size"]), e["off"], e["kompresi"]))
 
-
-# --------------------------------------------------------------------------- #
-#  Utama
-# --------------------------------------------------------------------------- #
 def main(argv=None):
     global _WARNINGS
     _WARNINGS = []
     ap = argparse.ArgumentParser(description=SCRIPT, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--stock", required=True, help="vendor_boot STOK (dari OTA/fastboot ROM)")
+    ap.add_argument("--stock", required=True, help="STOCK vendor_boot (from OTA/fastboot ROM)")
     ap.add_argument("--fragment", required=True, help="ramdisk recovery OrangeFox: cpio / .gz / .xz / .zst / .lz4")
-    ap.add_argument("--output", default="vendor_boot_hybrid.img", help="file output hybrid")
+    ap.add_argument("--output", default="vendor_boot_hybrid.img", help="hybrid output file")
     ap.add_argument("--partition-size", type=lambda x: int(x, 0), default=None,
-                    help="ukuran partisi vendor_boot (default: ukuran file stok)")
+                    help="vendor_boot partition size (default: stock file size)")
     ap.add_argument("--avb-headroom", type=lambda x: int(x, 0), default=0,
-                    help="ruang cadangan utk footer AVB avbtool (mis. 8192)")
+                    help="reserve space for the avbtool AVB footer (e.g. 8192)")
     ap.add_argument("--codec", choices=["auto", "zstd", "xz", "lzma", "gzip"], default="auto",
-                    help="paksa codec fragmen Fox (default: auto = yang pertama muat)")
+                    help="force the Fox fragment codec (default: auto = first one that fits)")
     ap.add_argument("--recompress-stock", choices=["auto", "never", "force"], default="auto",
-                    help="kompres ulang blob stok yang dipertahankan (default auto)")
+                    help="recompress kept stock blobs (default: auto)")
     ap.add_argument("--keep-stock-recovery", action="store_true",
-                    help="jangan ganti entri RECOVERY stok — Fox ditambah sebagai entri baru")
+                    help="do not replace the stock RECOVERY entry — Fox is added as a new entry")
     ap.add_argument("--entry-name", default=None,
-                    help="nama entri Fox (default: pertahankan nama stok / 'recovery' bila menambah)")
+                    help="Fox entry name (default: keep the stock name / 'recovery' when adding)")
     ap.add_argument("--pad-to-partition", action="store_true",
-                    help="pad output persis sebesar partisi (tanpa footer AVB)")
-    ap.add_argument("--report", default=None, help="tulis laporan JSON")
-    ap.add_argument("--dry-run", action="store_true", help="hitung anggaran saja, tidak menulis file")
+                    help="pad the output exactly to partition size (no AVB footer)")
+    ap.add_argument("--report", default=None, help="write the JSON report")
+    ap.add_argument("--dry-run", action="store_true", help="compute the budget only, write no files")
     args = ap.parse_args(argv)
 
     print("== %s — vendor_boot hybrid malachite ==" % SCRIPT)
     t0 = time.time()
 
-    # ---------- 1. stok ----------
-    stok_data = open(args.stock, "rb").read()
-    stok = parse_vb(stok_data, "stok")
-    partition = args.partition_size or stok["file_size"]
-    page = stok["page"]
-    print("[+] stok: %s B | header v4 | page %d | vr_size %s B | %d entri x %d B (%s)"
-          % (fmt(stok["file_size"]), page, fmt(stok["vr_size"]), stok["ent_num"],
-             stok["ent_size"], stok["tbl_mode"]))
-    if stok["ent_size"] != 108:
-        _warn("entry_size stok = %d (bukan 108) — patch tetap aman utk field 44 byte pertama" % stok["ent_size"])
-    if stok["avb"]:
-        print("[i] footer AVBf stok: orig_size=%s B (akan dibuang dari output)"
-              % fmt(stok["avb"]["orig_size"]))
-    dump_entri(stok)
+    stock_data = open(args.stock, "rb").read()
+    stock_img = parse_vb(stock_data, "stock")
+    partition = args.partition_size or stock_img["file_size"]
+    page = stock_img["page"]
+    print("[+] stock: %s B | header v4 | page %d | vr_size %s B | %d entrieses x %d B (%s)"
+          % (fmt(stock_img["file_size"]), page, fmt(stock_img["vr_size"]), stock_img["ent_num"],
+             stock_img["ent_size"], stock_img["tbl_mode"]))
+    if stock_img["ent_size"] != 108:
+        _warn("stock entry_size = %d (not 108) — patching stays safe for the first 44 bytes of fields" % stock_img["ent_size"])
+    if stock_img["avb"]:
+        print("[i] stock AVBf footer: orig_size=%s B (will be dropped from the output)"
+              % fmt(stock_img["avb"]["orig_size"]))
+    dump_entry(stock_img)
 
-    # ---------- 2. fragment recovery OrangeFox ----------
-    cpio_raw, kind_in, how_in = muat_fragment(args.fragment)
+    cpio_raw, kind_in, how_in = load_fragment(args.fragment)
     n_cpio = cpio_raw.count(b"070701")
-    print("[+] cpio recovery OrangeFox: ~%d header cpio, %s B (input %s -> dibuka sbg %s)"
+    print("[+] OrangeFox recovery cpio: ~%d cpio headers, %s B (input %s -> opened as %s)"
           % (n_cpio, fmt(len(cpio_raw)), kind_in, how_in))
 
-    # ---------- 3. komposisi entri ----------
     if args.keep_stock_recovery:
-        kept = [dict(e) for e in stok["entries"]]
-        rec_stok = next((e for e in stok["entries"] if e["type"] == TYPE_RECOVERY), None)
-        mode_entri = "tambah"
+        kept = [dict(e) for e in stock_img["entrieses"]]
+        rec_stock = next((e for e in stock_img["entrieses"] if e["type"] == TYPE_RECOVERY), None)
+        entry_mode = "tambah"
     else:
-        kept = [dict(e) for e in stok["entries"] if e["type"] != TYPE_RECOVERY]
-        rec_stok = next((e for e in stok["entries"] if e["type"] == TYPE_RECOVERY), None)
-        mode_entri = "ganti"
-        hilang = [e for e in stok["entries"] if e["type"] == TYPE_RECOVERY]
-        for e in hilang:
-            print("[+] blob RECOVERY stok '%s' (%s B, %s) DIGANTI blob OrangeFox — entri lain utuh"
+        kept = [dict(e) for e in stock_img["entrieses"] if e["type"] != TYPE_RECOVERY]
+        rec_stock = next((e for e in stock_img["entrieses"] if e["type"] == TYPE_RECOVERY), None)
+        entry_mode = "ganti"
+        missing = [e for e in stock_img["entrieses"] if e["type"] == TYPE_RECOVERY]
+        for e in missing:
+            print("[+] stock RECOVERY blob '%s' (%s B, %s) REPLACED with the OrangeFox blob — other entrieses intact"
                   % (e["name"] or "?", fmt(e["size"]), e["kompresi"]))
-        if rec_stok is None:
-            _warn("stok TIDAK punya entri bertipe RECOVERY — OrangeFox ditambah sebagai entri baru "
-                  "(komposisi ini tetap valid: bootloader memuat PLATFORM/DLKM saat normal, "
-                  "+RECOVERY saat recovery)")
+        if rec_stock is None:
+            _warn("stock has NO RECOVERY-type entry — OrangeFox is added as a new entry "
+                  "(this composition stays valid: the bootloader loads PLATFORM/DLKM in normal mode, "
+                  "+RECOVERY in recovery mode)")
     if not kept:
-        _warn("tidak ada blob stok yang dipertahankan — boot normal akan bergantung penuh pada isi entri baru")
+        _warn("no stock blobs kept — normal boot fully depends on the new entry content")
 
     kept_end = max([e["off"] + e["size"] for e in kept], default=0)
-    tbl_size_new = (len(kept) + 1) * stok["ent_size"]
+    tbl_size_new = (len(kept) + 1) * stock_img["ent_size"]
 
-    # ---------- 4. pilih codec ----------
     codecs = codec_list()
     if args.codec != "auto":
         codecs = [c for c in codecs if c[0] == args.codec]
         if not codecs:
-            raise AsmError("codec %s tidak tersedia di lingkungan ini (butuh CLI zstd?)" % args.codec)
-    skema = []
+            raise AsmError("codec %s unavailable in this environment (zstd CLI missing?)" % args.codec)
+    schema = []
     if args.recompress_stock in ("auto", "never"):
-        skema += [("as-is", c) for c in codecs]
+        schema += [("as-is", c) for c in codecs]
     if args.recompress_stock in ("auto", "force"):
-        skema += [("stock-ikut", c) for c in codecs]
+        schema += [("stock-recomp", c) for c in codecs]
     if args.recompress_stock == "force":
-        skema = [("stock-ikut", c) for c in codecs]
+        schema = [("stock-recomp", c) for c in codecs]
 
-    kandidat, dipilih = [], None
-    for mode_skema, (codec_name, comp_fn) in [(m, c) for m, c in skema]:
+    candidates, chosen = [], None
+    for mode_schema, (codec_name, comp_fn) in [(m, c) for m, c in schema]:
         fox_blob = comp_fn(cpio_raw)
-        if mode_skema == "as-is":
+        if mode_schema == "as-is":
             kept_cur, stock_codec, kept_end_cur = kept, None, kept_end
         else:
-            kept_cur, cat = rekompress_kept(kept, codec_name, comp_fn)
+            kept_cur, cat = recompress_kept(kept, codec_name, comp_fn)
             stock_codec = codec_name
             kept_end_cur = max([e["off"] + e["size"] for e in kept_cur], default=0)
             for c in cat:
                 _warn(c)
-        total, fox_off, vr_new = hitung_layout(page, kept_end_cur, len(fox_blob),
-                                               stok["dtb_size"], tbl_size_new, stok["bootcfg"])
-        muat = total + args.avb_headroom <= partition
-        kandidat.append({"mode": mode_skema, "codec": codec_name, "fox": len(fox_blob),
-                         "total": total, "muat": muat})
-        print("  [>] kandidat %-10s %-6s : fox=%s  total=%s  %s" %
-              ("[%s]" % mode_skema, codec_name, fmt(len(fox_blob)), fmt(total),
-               "MUAT" if muat else "tidak muat (partisi %s%s)" %
+        total, fox_off, vr_new = compute_layout(page, kept_end_cur, len(fox_blob),
+                                               stock_img["dtb_size"], tbl_size_new, stock_img["bootcfg"])
+        load = total + args.avb_headroom <= partition
+        candidates.append({"mode": mode_schema, "codec": codec_name, "fox": len(fox_blob),
+                         "total": total, "muat": load})
+        print("  [>] candidate %-10s %-6s : fox=%s  total=%s  %s" %
+              ("[%s]" % mode_schema, codec_name, fmt(len(fox_blob)), fmt(total),
+               "MUAT" if load else "does not fit (partition %s%s)" %
                (fmt(partition), " - headroom %s" % fmt(args.avb_headroom) if args.avb_headroom else "")))
-        if muat and dipilih is None:
-            dipilih = {"mode": mode_skema, "codec": codec_name, "stock_codec": stock_codec,
+        if load and chosen is None:
+            chosen = {"mode": mode_schema, "codec": codec_name, "stock_codec": stock_codec,
                        "kept": kept_cur, "kept_end": kept_end_cur, "fox_blob": fox_blob,
                        "fox_off": fox_off, "vr": vr_new, "total": total}
             break
-    if dipilih is None:
-        best = min(kandidat, key=lambda k: k["total"]) if kandidat else None
-        pesan = ["TIDAK MUAT: tidak ada kombinasi codec yang muat di partisi %s B (headroom AVB %s B)."
+    if chosen is None:
+        best = min(candidates, key=lambda k: k["total"]) if candidates else None
+        msg = ["DOES NOT FIT: no codec combination fits partition %s B (AVB headroom %s B)."
                  % (fmt(partition), fmt(args.avb_headroom))]
         if best:
-            pesan.append("Kombinasi terkecil: %s/%s -> total %s B (kelebihan %s B)." %
+            msg.append("Smallest combination: %s/%s -> total %s B (overrun %s B)." %
                          (best["mode"], best["codec"], fmt(best["total"]), fmt(best["total"] + args.avb_headroom - partition)))
-        pesan.append("Saran: (1) perkecil rootfs OrangeFox (tema/res tambahan), (2) cek CLI zstd "
-                     "terpasang (rasio terbaik+dekompresi cepat), (3) gunakan partisi benar.")
-        raise AsmError(" ".join(pesan))
+        msg.append("Suggestions: (1) shrink the OrangeFox rootfs (extra themes/res), (2) check the zstd CLI "
+                     "is installed (best ratio + fast decompression), (3) use the correct partition.")
+        raise AsmError(" ".join(msg))
 
-    fox_blob = dipilih["fox_blob"]
-    fox_off = dipilih["fox_off"]
-    vr_new = dipilih["vr"]
-    kept_cur = dipilih["kept"]
-    tbl_size_new = (len(kept_cur) + 1) * stok["ent_size"]
+    fox_blob = chosen["fox_blob"]
+    fox_off = chosen["fox_off"]
+    vr_new = chosen["vr"]
+    kept_cur = chosen["kept"]
+    tbl_size_new = (len(kept_cur) + 1) * stock_img["ent_size"]
 
-    # ---------- 5. entri Fox ----------
-    if mode_entri == "ganti" and rec_stok is not None:
-        fox_raw_ent = bytearray(rec_stok["raw"])          # byte custom stok dipertahankan
-        patch_entry(fox_raw_ent, len(fox_blob), fox_off)  # type & nama stok tetap
+    if entry_mode == "ganti" and rec_stock is not None:
+        fox_raw_ent = bytearray(rec_stock["raw"])          
+        patch_entry(fox_raw_ent, len(fox_blob), fox_off)  
     else:
-        sumber = next((e for e in kept_cur if e["type"] == TYPE_PLATFORM), kept_cur[0] if kept_cur else rec_stok)
-        fox_raw_ent = bytearray(sumber["raw"] if sumber is not None else
-                                bytearray(stok["ent_size"]))
-        if len(fox_raw_ent) < stok["ent_size"]:
-            fox_raw_ent += b"\x00" * (stok["ent_size"] - len(fox_raw_ent))
+        source = next((e for e in kept_cur if e["type"] == TYPE_PLATFORM), kept_cur[0] if kept_cur else rec_stock)
+        fox_raw_ent = bytearray(source["raw"] if source is not None else
+                                bytearray(stock_img["ent_size"]))
+        if len(fox_raw_ent) < stock_img["ent_size"]:
+            fox_raw_ent += b"\x00" * (stock_img["ent_size"] - len(fox_raw_ent))
         patch_entry(fox_raw_ent, len(fox_blob), fox_off, etype=TYPE_RECOVERY,
                     name=args.entry_name or "recovery", zero_board=True)
 
-    # ---------- 6. rakit ----------
-    hdr = bytearray(stok["header_page"])                  # seluruh byte halaman header dipertahankan
+    hdr = bytearray(stock_img["header_page"])                  
     struct.pack_into("<I", hdr, OFF_VRSIZE, vr_new)
     struct.pack_into("<I", hdr, OFF_TBLSIZE, tbl_size_new)
     struct.pack_into("<I", hdr, OFF_ENTNUM, len(kept_cur) + 1)
@@ -594,38 +488,36 @@ def main(argv=None):
     region[fox_off:fox_off + len(fox_blob)] = fox_blob
     out += region
     out += b"\x00" * ((page - len(out) % page) % page)
-    out += stok["dtb"]
+    out += stock_img["dtb"]
     out += b"\x00" * ((page - len(out) % page) % page)
     out += b"".join(bytes(e["raw"]) for e in kept_cur) + bytes(fox_raw_ent)
     out += b"\x00" * ((page - len(out) % page) % page)
-    out += stok["bootcfg_bytes"]
+    out += stock_img["bootcfg_bytes"]
     out += b"\x00" * ((page - len(out) % page) % page)
     if args.pad_to_partition:
         if len(out) > partition:
-            raise AsmError("pad-to-partition: isi %s B > partisi %s B" % (fmt(len(out)), fmt(partition)))
+            raise AsmError("pad-to-partition: content %s B > partition %s B" % (fmt(len(out)), fmt(partition)))
         out += b"\x00" * (partition - len(out))
 
-    # ---------- 7. verifikasi mandiri ----------
-    v, ket = verifikasi(bytes(out), stok, kept, dipilih["mode"], fox_raw_ent,
+    v, note = verify(bytes(out), stock_img, kept, chosen["mode"], fox_raw_ent,
                         fox_blob, cpio_raw)
 
-    # ---------- 8. laporan ----------
     print("")
-    print("[=] codec fragmen Fox : %s (mode stok: %s%s)" %
-          (dipilih["codec"], dipilih["mode"],
-           ", blob stok ikut dikompres %s" % dipilih["stock_codec"] if dipilih["stock_codec"] else ""))
-    for k in ket:
+    print("[=] Fox fragment codec : %s (stock mode: %s%s)" %
+          (chosen["codec"], chosen["mode"],
+           ", stock blobs recompressed with %s" % chosen["stock_codec"] if chosen["stock_codec"] else ""))
+    for k in note:
         print("  " + k)
-    sisa = partition - args.avb_headroom - dipilih["total"]
-    print("[=] total %s B dari %s B partisi — sisa %s B (headroom AVB %s B)"
-          % (fmt(dipilih["total"]), fmt(partition),
-             fmt(max(sisa, 0)), fmt(args.avb_headroom)))
-    print("[i] boot normal: blob PLATFORM/DLKM stok %s — TIDAK tersentuh (byte-persis)" %
-          ("byte-persis" if dipilih["mode"] == "as-is" else "dikompres ulang, isi sama"))
-    print("[i] kernel GKI android15-6.6: RD_GZIP/RD_LZMA/RD_XZ/RD_LZ4/RD_ZSTD default y; "
-          "fragmen RECOVERY hanya dimuat saat mode recovery (gagal dekompresi tidak memengaruhi boot normal).")
-    print("[i] bila recovery gagal boot (langka): ulangi dgn --codec xz atau --codec gzip "
-          "(+ --recompress-stock force bila perlu ruang).")
+    rest = partition - args.avb_headroom - chosen["total"]
+    print("[=] total %s B of %s B partition — %s B free (AVB headroom %s B)"
+          % (fmt(chosen["total"]), fmt(partition),
+             fmt(max(rest, 0)), fmt(args.avb_headroom)))
+    print("[i] normal boot: stock PLATFORM/DLKM blobs %s — untouched (byte-exact)" %
+          ("byte-exact" if chosen["mode"] == "as-is" else "recompressed, same content"))
+    print("[i] GKI kernel android15-6.6: RD_GZIP/RD_LZMA/RD_XZ/RD_LZ4/RD_ZSTD default y; "
+          "the RECOVERY fragment loads only in recovery mode (decompression failure does not affect normal boot).")
+    print("[i] if recovery fails to boot (rare): retry with --codec xz or --codec gzip "
+          "(+ --recompress-stock force if space is needed).")
     print("[=] %s — %s B, sha256 %s" % (args.output, fmt(len(out)), sha256(bytes(out))[:32]))
 
     if not args.dry_run:
@@ -634,25 +526,24 @@ def main(argv=None):
     if args.report:
         rep = {
             "tool": SCRIPT, "waktu": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "stok": {"file": args.stock, "size": stok["file_size"], "vr_size": stok["vr_size"],
-                     "entri": [{"name": e["name"], "type": e["type"], "size": e["size"],
-                                "off": e["off"], "kompresi": e["kompresi"]} for e in stok["entries"]],
-                     "avb": stok["avb"]},
+            "stock": {"file": args.stock, "size": stock_img["file_size"], "vr_size": stock_img["vr_size"],
+                     "entries": [{"name": e["name"], "type": e["type"], "size": e["size"],
+                                "off": e["off"], "kompresi": e["kompresi"]} for e in stock_img["entrieses"]],
+                     "avb": stock_img["avb"]},
             "fragment": {"file": args.fragment, "input": kind_in, "cpio_bytes": len(cpio_raw)},
-            "dipilih": {"mode": dipilih["mode"], "codec": dipilih["codec"],
-                        "stock_codec": dipilih["stock_codec"], "fox_blob": len(fox_blob),
-                        "total": dipilih["total"], "sisa": sisa},
-            "kandidat": kandidat,
+            "dipilih": {"mode": chosen["mode"], "codec": chosen["codec"],
+                        "stock_codec": chosen["stock_codec"], "fox_blob": len(fox_blob),
+                        "total": chosen["total"], "sisa": rest},
+            "kandidat": candidates,
             "output": {"file": None if args.dry_run else args.output,
                        "size": len(out), "sha256": sha256(bytes(out))},
             "peringatan": _WARNINGS,
         }
         with open(args.report, "w") as f:
             json.dump(rep, f, indent=2, ensure_ascii=False)
-        print("[=] laporan: %s" % args.report)
-    print("[=] selesai dalam %.1f s" % (time.time() - t0))
+        print("[=] report: %s" % args.report)
+    print("[=] finished in %.1f s" % (time.time() - t0))
     return 0
-
 
 if __name__ == "__main__":
     try:
