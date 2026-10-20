@@ -20,6 +20,18 @@ env:
   # the OrangeFox build glue adds the C-level quotes itself when it emits
   # the -D flags, so literal quotes here would end up doubled in C++.
   MAINTAINER: VikrieGunawan
+  # ---- Version / build type (maintainer request: R12.0_0 Beta) ----
+  # OrangeFox_A16.sh composes the displayed release as:
+  #   FOX_BUILD = FOX_INTERNAL_RELEASE ("R12.0", exported inside that script)
+  #             + "_" + FOX_MAINTAINER_PATCH_VERSION            -> "R12.0_0"
+  # and names the image "OrangeFox-$FOX_BUILD-$FOX_BUILD_TYPE-$DEVICE.img"
+  #   -> OrangeFox-R12.0_0-Beta-malachite.img (also shown on the About page).
+  # Both vars are READ from the environment by OrangeFox_A16.sh, so setting
+  # them here is sufficient - no device-tree edits needed.
+  FOX_MAINTAINER_PATCH_VERSION: "0"
+  FOX_BUILD_TYPE: Beta
+  # Short label used by the artifact names below (keep in sync with the above)
+  ARTIFACT_LABEL: R12.0_0-Beta
 
 # Never run two builds at once: a new push/dispatch automatically replaces a
 # running build. (The replaced run ends with exit code 143 — that is the normal
@@ -30,7 +42,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build OrangeFox Unofficial (malachite)
+    name: Build OrangeFox R12.0_0-Beta (malachite)
     # Pinned deliberately: ubuntu-22.04 is deprecated (support ended 2026-09-17)
     # and 'ubuntu-latest' is mid-migration from 24.04 to 26.04 (Oct-Nov 2026),
     # so 'ubuntu-latest' would make builds non-reproducible while the image
@@ -896,13 +908,14 @@ jobs:
             exit 1
           fi
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          cp "$IMG" "$GITHUB_WORKSPACE/artifacts/OrangeFox-Unofficial-$DEVICE_CODENAME.img"
+          ART="OrangeFox-${ARTIFACT_LABEL}-${DEVICE_CODENAME}"
+          cp "$IMG" "$GITHUB_WORKSPACE/artifacts/$ART.img"
           cd "$GITHUB_WORKSPACE/artifacts"
-          zip -9 "OrangeFox-Unofficial-$DEVICE_CODENAME.zip" "OrangeFox-Unofficial-$DEVICE_CODENAME.img"
+          zip -9 "$ART.zip" "$ART.img"
           sha256sum * > sha256sums.txt
           ls -la
           {
-            echo "### OrangeFox Unofficial — $DEVICE_CODENAME"
+            echo "### OrangeFox ${ARTIFACT_LABEL} — $DEVICE_CODENAME"
             echo '```'
             cat sha256sums.txt
             echo '```'
@@ -911,7 +924,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: OrangeFox-Unofficial-malachite
+          name: OrangeFox-R12.0_0-Beta-malachite
           path: artifacts/*
           retention-days: 30
           if-no-files-found: error
