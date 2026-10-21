@@ -226,7 +226,7 @@ def main():
     elif path.lower().endswith(".zip"):
         path = extract_from_zip(path)
 
-    print("OrangeFox vendor_boot checker v3 — %s" % DEV)
+    print("OrangeFox vendor_boot checker v4 — %s" % DEV)
     print("Target: %s" % path)
 
     try:
@@ -295,8 +295,8 @@ def main():
                 note = "RECOVERY FOUND: %s" % ", ".join(sc["recbin"][:2])
             else:
                 note = "%d files, no recovery binary" % sc["nfiles"]
-            info("- %-24s type=%-8s size=%-9d content: %s" %
-                 (e["name"] or "(no name)", nm, e["size"], note))
+            info("- %-24s type=%-8s size=%-9d off=%-9d content: %s" %
+                 (e["name"] or "(no name)", nm, e["size"], e["off"], note))
             if not sc["recbin"]:
                 sc["raw"] = None  
         rec_hits = [s for s in scans if s["recbin"]]
@@ -323,8 +323,18 @@ def main():
         else:
             bad("The 'recovery' binary was NOT found in any component — the image will not boot to recovery!")
         endmax = max([e["off"] + e["size"] for e in h["entries"]] or [0])
-        if endmax == h["vr_size"]:
-            passlog("Entry coverage (%d) = vendor_ramdisk_size — consistent structure" % endmax)
+        gaps = [(h["entries"][i], h["entries"][i + 1])
+                for i in range(len(h["entries"]) - 1)
+                if h["entries"][i]["off"] + h["entries"][i]["size"] != h["entries"][i + 1]["off"]]
+        if endmax == h["vr_size"] and not gaps:
+            passlog("Entries are CONTIGUOUS and cover vendor_ramdisk_size exactly (%d B) — stock "
+                    "byte-layout convention (stream-loading bootloaders need this)" % endmax)
+        elif endmax == h["vr_size"] and gaps:
+            bad("GAP between table entries: %s — a bootloader that streams the whole ramdisk region "
+                "sees garbage inside the initramfs and fails to boot in EVERY mode (this was the "
+                "hybrid_assembler v2 defect; rebuild with v3)" %
+                ", ".join("%d B after entry '%s'" % (b["off"] - a["off"] - a["size"], a["name"] or "(default)")
+                          for a, b in gaps))
         elif rec_hits or any(s["nfiles"] > 0 for s in scans):
             warn("Entry coverage (%d) != vendor_ramdisk_size (%d) — component content reads normally, "
                  "the gap is probably just page rounding — not a blocker" % (endmax, h["vr_size"]))
@@ -363,6 +373,13 @@ def main():
             info("Maintainer unreadable (safe to ignore)")
 
     sect(5, "FOOTER AVB / VBMETA (big-endian)")
+    page = h["page"]
+    dtb_abs = page_align(page + h["vr_size"], page)
+    tbl_abs = page_align(dtb_abs + h["dtb_size"], page)
+    bcfg_abs = page_align(tbl_abs + h["tbl_size"], page)
+    content_end = page_align(bcfg_abs + h["bootcfg"], page)
+    info("Computed content end: %d B (dtb@%d, table@%d) — the AVB footer orig_size must equal this" %
+         (content_end, dtb_abs, tbl_abs))
     if h["avb"]:
         a = h["avb"]
         sane = (0 < a["orig_size"] <= h["size"]
@@ -374,6 +391,15 @@ def main():
             vb = h["raw"][a["vbmeta_off"]:a["vbmeta_off"] + a["vbmeta_size"]]
             if vb[:4] == b"AVB0":
                 passlog("Blob vbmeta AVB0 valid")
+                fl = struct.unpack_from(">I", vb, 72)[0] if len(vb) >= 76 else 0
+                info("vbmeta flags=%d (1=verity disabled, 2=verification disabled, 3=both)" % fl)
+                if a["orig_size"] == content_end:
+                    passlog("footer orig_size %d == computed content end — footer matches THIS layout "
+                            "(freshly rebuilt, not stale)" % content_end)
+                else:
+                    bad("footer orig_size=%d != computed content end %d — the footer was built for a "
+                        "different image (stale/copy); bootloader validation may fail" %
+                        (a["orig_size"], content_end))
                 if b"vendor_boot" in vb[:4096]:
                     passlog("Hash descriptor for partition 'vendor_boot' present")
                 else:
@@ -381,12 +407,13 @@ def main():
                 algo = struct.unpack_from(">I", vb, 28)[0] if len(vb) >= 32 else -1
                 info("AVB algorithm type: %d (0=unsigned; unlocked bootloader still boots)" % algo)
             else:
-                warn("vbmeta_offset does not point to an AVB0 blob")
+                bad("vbmeta_offset does not point to an AVB0 blob")
         else:
-            warn("AVBf footer present but fields out of file bounds — "
-                 "not fatal on an unlocked bootloader; hexdump: %s" % h["raw"][-64:].hex()[:96])
+            bad("AVBf footer present but fields out of file bounds — rebuild with hybrid_assembler v3")
     else:
-        warn("No AVB footer — normal on an unlocked bootloader, but not standard for GKI builds")
+        bad("NO AVB footer — the stock image HAS one and many MTK bootloaders refuse footerless "
+            "vendor_boot images. Rebuild with hybrid_assembler v3 + --avbtool (the v6 pipeline does "
+            "this automatically)")
 
     sect(6, "PHONE PARTITION MATCH")
     if h["size"] <= EXP_PART_SIZE:
