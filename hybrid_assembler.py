@@ -5,13 +5,14 @@ import gzip
 import hashlib
 import json
 import lzma
+import os
 import shutil
 import struct
 import subprocess
 import sys
 import time
 
-SCRIPT = "hybrid_assembler.py v2"
+SCRIPT = "hybrid_assembler.py v3"
 
 MAGIC_VB = b"VNDRBOOT"
 MAGIC_DTB = b"\xd0\x0d\xfe\xed"
@@ -31,6 +32,10 @@ MAGIC_GZ = b"\x1f\x8b"
 MAGIC_ZSTD = b"\x28\xb5\x2f\xfd"
 MAGIC_XZ = b"\xfd7zXZ\x00"
 MAGIC_LZ4 = b"\x04\x22\x4d\x18"
+MAGIC_AVBF = b"AVBf"
+MAGIC_AVB0 = b"AVB0"
+AVB_FLAG_VERITY_DISABLED = 1
+AVB_FLAG_VERIFICATION_DISABLED = 2
 
 class AsmError(Exception):
     pass
@@ -228,12 +233,76 @@ def _avb_footer(data: bytes):
 
 def compute_layout(page, kept_end, fox_size, dtb_size, tbl_size, bootcfg_size):
     pass
-    fox_off = align(kept_end, page)
+    fox_off = kept_end
     vr = fox_off + fox_size
     dtb_abs = align(page + vr, page)
     tbl_abs = align(dtb_abs + dtb_size, page)
     bcfg_abs = align(tbl_abs + tbl_size, page)
     return align(bcfg_abs + bootcfg_size, page), fox_off, vr
+
+def cpio_strip_init(raw):
+    if raw[:6] not in (b"070701", b"070702"):
+        return raw, []
+    out = bytearray()
+    removed = []
+    off, n = 0, len(raw)
+    while off + 110 <= n and raw[off:off + 6] in (b"070701", b"070702"):
+        f = [int(raw[off + 6 + i * 8: off + 14 + i * 8], 16) for i in range(13)]
+        namesize, fsize = f[11], f[6]
+        name = raw[off + 110: off + 110 + namesize - 1]
+        doff = (off + 110 + namesize + 3) & ~3
+        end = (doff + fsize + 3) & ~3
+        if name.rstrip(b"\x00") == b"TRAILER!!!":
+            off = end
+            continue
+        nm = name.decode("utf-8", "replace")
+        drop = ("/" not in nm) and nm.startswith("init") and not nm.startswith("init.recovery")
+        if not drop:
+            out += raw[off:end]
+        else:
+            removed.append(nm)
+        off = end
+    if not removed:
+        return raw, []
+    fields = [0] * 13
+    fields[11] = 11
+    out += b"070701" + b"".join(b"%08X" % x for x in fields) + b"TRAILER!!!\x00"
+    while len(out) % 4:
+        out += b"\x00"
+    return bytes(out), removed
+
+def run_avbtool(avbtool, out_path, partition, flags):
+    base = [sys.executable, avbtool, "add_hash_footer",
+            "--image", out_path, "--partition_name", "vendor_boot",
+            "--partition_size", str(partition), "--algorithm", "NONE"]
+    attempts = [base + ["--flags", str(flags)], base]
+    last = ""
+    for cmd in attempts:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        except (OSError, subprocess.TimeoutExpired) as ex:
+            last = str(ex)
+            continue
+        if r.returncode == 0:
+            return
+        last = (r.stderr or r.stdout or "").strip()
+    raise AsmError("avbtool add_hash_footer failed: %s" % last[:500])
+
+def verify_footer(data, content_size, partition, flags):
+    if len(data) != partition:
+        raise AsmError("final image %d B != partition size %d B" % (len(data), partition))
+    foot = data[-64:]
+    if foot[:4] != MAGIC_AVBF:
+        raise AsmError("AVB footer missing after avbtool run (tail is not AVBf)")
+    orig, voff, vsz = struct.unpack_from(">QQQ", foot, 12)
+    if orig != content_size:
+        raise AsmError("footer orig_size=%d != content size=%d" % (orig, content_size))
+    if voff + vsz > len(data) or data[voff:voff + 4] != MAGIC_AVB0:
+        raise AsmError("vbmeta blob invalid at offset %d" % voff)
+    fflags = struct.unpack_from(">I", data, voff + 72)[0]
+    if flags and fflags != flags:
+        _warn("vbmeta flags=%d (requested %d) — this avbtool build ignored --flags" % (fflags, flags))
+    return {"orig_size": orig, "vbmeta_off": voff, "vbmeta_size": vsz, "flags": fflags}
 
 def patch_entry(raw: bytearray, size: int, off: int, etype=None, name=None, zero_board=False):
     struct.pack_into("<III", raw, E_SIZE, size, off, etype if etype is not None
@@ -289,6 +358,11 @@ def verify(out: bytes, stock_img: dict, kept_orig: list, schema_mode: str,
     chk(v["vr_size"] == max([e["off"] + e["size"] for e in v["entrieses"]] or [0]),
         "vr_size %s = end of the last blob" % fmt(v["vr_size"]))
     chk(v["ent_num"] == len(kept_orig) + 1, "ent_num=%d (stock kept + 1 Fox entry)" % v["ent_num"])
+    for i in range(len(v["entrieses"]) - 1):
+        a, b = v["entrieses"][i], v["entrieses"][i + 1]
+        chk(a["off"] + a["size"] == b["off"],
+            "entries CONTIGUOUS: entry[%d] ends at %d = entry[%d] offset (no gaps — stock convention, "
+            "stream-loading bootloaders depend on it)" % (i, a["off"] + a["size"], i + 1))
 
     for i, orig in enumerate(kept_orig):
         e = v["entrieses"][i]
@@ -311,7 +385,7 @@ def verify(out: bytes, stock_img: dict, kept_orig: list, schema_mode: str,
     chk(dec == cpio_orig, "Fox blob decompressed back (%s) = original cpio %s B" % (how, fmt(len(cpio_orig))))
     chk(v["dtb"] == stock_img["dtb"], "DTB byte-exact from stock (%s B)" % fmt(stock_img["dtb_size"]))
     chk(v["bootcfg_bytes"] == stock_img["bootcfg_bytes"], "bootconfig kept (%s B)" % fmt(stock_img["bootcfg"]))
-    chk(v["avb"] is None, "old AVB footer dropped (avbtool/pipeline will re-add it)")
+    chk(v["avb"] is None, "content built without AVB footer (--avbtool adds a fresh one on the final file)")
     return v, note
 
 _WARNINGS = []
@@ -361,7 +435,14 @@ def main(argv=None):
     ap.add_argument("--entry-name", default=None,
                     help="Fox entry name (default: keep the stock name / 'recovery' when adding)")
     ap.add_argument("--pad-to-partition", action="store_true",
-                    help="pad the output exactly to partition size (no AVB footer)")
+                    help="pad the output exactly to partition size (no AVB footer; ignored with --avbtool)")
+    ap.add_argument("--avbtool", default=None,
+                    help="path to avbtool.py - re-adds a fresh AVB footer on the output (recommended)")
+    ap.add_argument("--avb-flags", type=lambda x: int(x, 0), default=3,
+                    help="vbmeta flags for the new footer (default 3 = verity+verification disabled)")
+    ap.add_argument("--strip-init", action="store_true",
+                    help="remove root-level init/init.rc files from the Fox cpio (stock-style fragment, "
+                         "for bootloaders that load RECOVERY fragments in every boot mode)")
     ap.add_argument("--report", default=None, help="write the JSON report")
     ap.add_argument("--dry-run", action="store_true", help="compute the budget only, write no files")
     args = ap.parse_args(argv)
@@ -387,6 +468,15 @@ def main(argv=None):
     n_cpio = cpio_raw.count(b"070701")
     print("[+] OrangeFox recovery cpio: ~%d cpio headers, %s B (input %s -> opened as %s)"
           % (n_cpio, fmt(len(cpio_raw)), kind_in, how_in))
+
+    removed_init = []
+    if args.strip_init:
+        cpio_raw, removed_init = cpio_strip_init(cpio_raw)
+        print("[+] strip-init: removed %d root-level init entry(ies)%s"
+              % (len(removed_init), ": " + ", ".join(removed_init) if removed_init else " (none found)"))
+        print("[i] noinit variant: the Fox fragment no longer carries its own /init — normal boot stays "
+              "safe even if the bootloader loads RECOVERY fragments in every mode; recovery boot relies "
+              "on the stock init flow exec-ing /system/bin/recovery from the fragment")
 
     if args.keep_stock_recovery:
         kept = [dict(e) for e in stock_img["entrieses"]]
@@ -494,7 +584,9 @@ def main(argv=None):
     out += b"\x00" * ((page - len(out) % page) % page)
     out += stock_img["bootcfg_bytes"]
     out += b"\x00" * ((page - len(out) % page) % page)
-    if args.pad_to_partition:
+    dtb_abs = align(page + chosen["vr"], page)
+    tbl_abs = align(dtb_abs + stock_img["dtb_size"], page)
+    if args.pad_to_partition and not args.avbtool:
         if len(out) > partition:
             raise AsmError("pad-to-partition: content %s B > partition %s B" % (fmt(len(out)), fmt(partition)))
         out += b"\x00" * (partition - len(out))
@@ -506,6 +598,8 @@ def main(argv=None):
     print("[=] Fox fragment codec : %s (stock mode: %s%s)" %
           (chosen["codec"], chosen["mode"],
            ", stock blobs recompressed with %s" % chosen["stock_codec"] if chosen["stock_codec"] else ""))
+    print("[i] layout: fox blob @%d (contiguous after stock blobs) | vr_size %s | dtb @%d | table @%d"
+          % (chosen["fox_off"], fmt(chosen["vr"]), dtb_abs, tbl_abs))
     for k in note:
         print("  " + k)
     rest = partition - args.avb_headroom - chosen["total"]
@@ -520,9 +614,45 @@ def main(argv=None):
           "(+ --recompress-stock force if space is needed).")
     print("[=] %s — %s B, sha256 %s" % (args.output, fmt(len(out)), sha256(bytes(out))[:32]))
 
+    avb_out = None
     if not args.dry_run:
-        with open(args.output, "wb") as f:
-            f.write(out)
+        if args.avbtool:
+            if args.pad_to_partition:
+                _warn("--pad-to-partition ignored: --avbtool owns the final padding")
+            tmp = args.output + ".content"
+            with open(tmp, "wb") as f:
+                f.write(out)
+            try:
+                shutil.copyfile(tmp, args.output)
+                run_avbtool(args.avbtool, args.output, partition, args.avb_flags)
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            fin = bytearray(open(args.output, "rb").read())
+            foot = fin[-64:]
+            if foot[:4] == MAGIC_AVBF and args.avb_flags:
+                _, voff, _ = struct.unpack_from(">QQQ", foot, 12)
+                if fin[voff:voff + 4] == MAGIC_AVB0 and voff + 76 <= len(fin):
+                    cur = struct.unpack_from(">I", fin, voff + 72)[0]
+                    if cur != args.avb_flags:
+                        struct.pack_into(">I", fin, voff + 72, args.avb_flags)
+                        with open(args.output, "wb") as f:
+                            f.write(bytes(fin))
+                        _warn("this avbtool build lacks --flags support - vbmeta flags "
+                              "byte-patched to %d directly (safe: algorithm NONE is unsigned)"
+                              % args.avb_flags)
+            avb_out = verify_footer(open(args.output, "rb").read(), len(out), partition, args.avb_flags)
+            print("[=] fresh AVB footer: orig_size=%s, vbmeta@%s (flags=%d — verity+verification disabled "
+                  "at the vendor_boot level)" % (fmt(avb_out["orig_size"]), fmt(avb_out["vbmeta_off"]),
+                                                   avb_out["flags"]))
+        else:
+            with open(args.output, "wb") as f:
+                f.write(out)
+            if stock_img["avb"]:
+                _warn("output has NO AVB footer while the stock image HAS one — many MTK bootloaders "
+                      "refuse footerless images; rerun with --avbtool <path-to-avbtool.py> (build/make/"
+                      "tools/releasetools/avbtool.py inside the synced tree) so the output matches the "
+                      "stock convention")
     if args.report:
         rep = {
             "tool": SCRIPT, "waktu": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -530,10 +660,14 @@ def main(argv=None):
                      "entries": [{"name": e["name"], "type": e["type"], "size": e["size"],
                                 "off": e["off"], "kompresi": e["kompresi"]} for e in stock_img["entrieses"]],
                      "avb": stock_img["avb"]},
-            "fragment": {"file": args.fragment, "input": kind_in, "cpio_bytes": len(cpio_raw)},
+            "fragment": {"file": args.fragment, "input": kind_in, "cpio_bytes": len(cpio_raw),
+                        "strip_init": removed_init},
+            "layout": {"fox_off": chosen["fox_off"], "vr_size": chosen["vr"],
+                       "dtb_abs": dtb_abs, "tbl_abs": tbl_abs},
             "dipilih": {"mode": chosen["mode"], "codec": chosen["codec"],
                         "stock_codec": chosen["stock_codec"], "fox_blob": len(fox_blob),
                         "total": chosen["total"], "sisa": rest},
+            "avb_output": avb_out,
             "kandidat": candidates,
             "output": {"file": None if args.dry_run else args.output,
                        "size": len(out), "sha256": sha256(bytes(out))},
