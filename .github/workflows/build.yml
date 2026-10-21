@@ -17,6 +17,10 @@ env:
   FOX_MAINTAINER_PATCH_VERSION: "0"
   FOX_BUILD_TYPE: Beta
   ARTIFACT_LABEL: R12.0_0-Beta
+  OTA_MIRRORS: >-
+    https://bigota.d.miui.com/OS2.0.208.0.VOOMIXM/malachite_global-ota_full-OS2.0.208.0.VOOMIXM-user-15.0-4b22dfd9d8.zip
+    https://hugeota.d.miui.com/OS2.0.208.0.VOOMIXM/malachite_global-ota_full-OS2.0.208.0.VOOMIXM-user-15.0-4b22dfd9d8.zip
+  STOCK_SIZE: "67108864"
 
 concurrency:
   group: orangefox-malachite-build
@@ -77,6 +81,37 @@ jobs:
           sudo chmod a+x /usr/local/bin/repo
           git config --global user.name "OrangeFox Builder"
           git config --global user.email "builder@users.noreply.github.com"
+
+      - name: Fetch stock vendor_boot from Xiaomi OTA (fail fast, before the long sync)
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          sudo apt-get install -y -qq lz4 zstd xz-utils >/dev/null 2>&1 || true
+          mkdir -p stock
+          STOCK="stock/vendor_boot_stok.img"
+          OK=0
+          for U in $OTA_MIRRORS; do
+            echo "Trying mirror: $U"
+            if python3 fetch_stock_vb.py "$U" "$STOCK" --partitions vendor_boot; then
+              echo "Mirror OK: $U"
+              OK=1
+              break
+            fi
+            echo "Mirror failed: $U"
+            rm -f "$STOCK"
+          done
+          if [ "$OK" -ne 1 ]; then
+            echo "ERROR: every Xiaomi OTA mirror failed — the OTA file name may have changed."
+            echo "Update OTA_MIRRORS in this workflow with the new OS2.0.208.0.VOOMIXM URL."
+            exit 1
+          fi
+          SZ=$(stat -c %s "$STOCK" 2>/dev/null || echo 0)
+          if [ "$SZ" -ne "$STOCK_SIZE" ]; then
+            echo "ERROR: stock vendor_boot is $SZ bytes (expected $STOCK_SIZE). Refusing to continue."
+            exit 1
+          fi
+          echo "=== stock vendor_boot OK ($SZ bytes) ==="
+          sha256sum "$STOCK"
 
       - name: Sync OrangeFox source tree (fox_16.0)
         run: |
@@ -594,23 +629,59 @@ jobs:
           fi
           echo "Build finished OK: $(date -u)"
 
-      - name: Collect build artifacts
+      - name: Collect plainbuild artifact
         run: |
           set -e
           cd "$GITHUB_WORKSPACE/workspace/fox_16.0"
           OUT="out/target/product/$DEVICE_CODENAME"
           IMG="$OUT/vendor_boot.img"
           if [ ! -f "$IMG" ]; then
-            echo "ERROR: vendor_boot.img was not produced. Contents of $OUT:"
+            echo "ERROR: vendor_boot.img (plainbuild) was not produced. Contents of $OUT:"
             ls -la "$OUT" 2>/dev/null || true
             find out/target/product -maxdepth 2 -name '*.img' || true
             exit 1
           fi
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          ART="OrangeFox-${ARTIFACT_LABEL}-${DEVICE_CODENAME}"
-          cp "$IMG" "$GITHUB_WORKSPACE/artifacts/$ART.img"
-          cd "$GITHUB_WORKSPACE/artifacts"
-          zip -9 "$ART.zip" "$ART.img"
+          cp "$IMG" "$GITHUB_WORKSPACE/artifacts/OrangeFox-${ARTIFACT_LABEL}-${DEVICE_CODENAME}-plainbuild.img"
+          echo "Plainbuild saved (diagnosis only — NOT flashable as recovery)."
+
+      - name: Harvest OrangeFox ramdisk from the plainbuild
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          sudo apt-get install -y -qq lz4 zstd xz-utils >/dev/null 2>&1 || true
+          python3 harvest_fox_ramdisk.py \
+            "workspace/fox_16.0/out/target/product/$DEVICE_CODENAME/vendor_boot.img" \
+            fox_ramdisk.cpio
+
+      - name: Assemble hybrid vendor_boot (stock base + Fox RECOVERY blob)
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p hybrid
+          python3 hybrid_assembler.py \
+            --stock stock/vendor_boot_stok.img \
+            --fragment fox_ramdisk.cpio \
+            --output hybrid/vendor_boot_hybrid.img \
+            --partition-size 67108864 \
+            --pad-to-partition \
+            --report assemble_report.json
+          sha256sum hybrid/vendor_boot_hybrid.img
+
+      - name: Gate - fox_check must report zero FAIL
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          python3 fox_check_malachite.py hybrid/vendor_boot_hybrid.img stock/vendor_boot_stok.img
+
+      - name: Collect final artifacts
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          cp hybrid/vendor_boot_hybrid.img "artifacts/OrangeFox-${ARTIFACT_LABEL}-${DEVICE_CODENAME}-vendor_boot.img"
+          cp assemble_report.json artifacts/ 2>/dev/null || true
+          cd artifacts
+          for F in *.img; do zip -9 "${F%.img}.zip" "$F"; done
           sha256sum * > sha256sums.txt
           ls -la
           {
@@ -618,6 +689,10 @@ jobs:
             echo '```'
             cat sha256sums.txt
             echo '```'
+            echo
+            echo "FLASH THIS: OrangeFox-${ARTIFACT_LABEL}-${DEVICE_CODENAME}-vendor_boot.img (hybrid)."
+            echo "*-plainbuild.img is for diagnosis only — it has no stock-preserving RECOVERY entry."
+            echo "Rollback: fastboot flash vendor_boot vendor_boot_stok.img"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifacts
