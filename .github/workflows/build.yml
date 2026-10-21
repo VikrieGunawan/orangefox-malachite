@@ -659,27 +659,50 @@ jobs:
           set -e
           cd "$GITHUB_WORKSPACE"
           mkdir -p hybrid
+          AVBTOOL="workspace/fox_16.0/build/make/tools/releasetools/avbtool.py"
+          if [ ! -f "$AVBTOOL" ]; then
+            AVBTOOL=$(find workspace/fox_16.0/build -name avbtool.py -print -quit 2>/dev/null || true)
+          fi
+          if [ ! -f "$AVBTOOL" ]; then
+            echo "ERROR: avbtool.py not found in the synced tree - cannot produce a valid AVB footer"
+            exit 1
+          fi
+          echo "avbtool: $AVBTOOL"
           python3 hybrid_assembler.py \
             --stock stock/vendor_boot_stok.img \
             --fragment fox_ramdisk.cpio \
             --output hybrid/vendor_boot_hybrid.img \
             --partition-size 67108864 \
-            --pad-to-partition \
+            --avbtool "$AVBTOOL" \
+            --avb-flags 3 \
             --report assemble_report.json
-          sha256sum hybrid/vendor_boot_hybrid.img
+          python3 hybrid_assembler.py \
+            --stock stock/vendor_boot_stok.img \
+            --fragment fox_ramdisk.cpio \
+            --output hybrid/vendor_boot_noinit.img \
+            --partition-size 67108864 \
+            --avbtool "$AVBTOOL" \
+            --avb-flags 3 \
+            --strip-init \
+            --report assemble_report_noinit.json
+          python3 "$AVBTOOL" make_vbmeta_image --flags 3 --padding_size 4096 --output hybrid/vbmeta_disabled.img
+          sha256sum hybrid/vendor_boot_hybrid.img hybrid/vendor_boot_noinit.img hybrid/vbmeta_disabled.img
 
-      - name: Gate - fox_check must report zero FAIL
+      - name: Gate - fox_check must report zero FAIL (both variants)
         run: |
           set -e
           cd "$GITHUB_WORKSPACE"
           python3 fox_check_malachite.py hybrid/vendor_boot_hybrid.img stock/vendor_boot_stok.img
+          python3 fox_check_malachite.py hybrid/vendor_boot_noinit.img stock/vendor_boot_stok.img
 
       - name: Collect final artifacts
         run: |
           set -e
           cd "$GITHUB_WORKSPACE"
           cp hybrid/vendor_boot_hybrid.img "artifacts/OrangeFox-${ARTIFACT_LABEL}-${DEVICE_CODENAME}-vendor_boot.img"
-          cp assemble_report.json artifacts/ 2>/dev/null || true
+          cp hybrid/vendor_boot_noinit.img "artifacts/OrangeFox-${ARTIFACT_LABEL}-${DEVICE_CODENAME}-vendor_boot_noinit.img"
+          cp hybrid/vbmeta_disabled.img artifacts/
+          cp assemble_report.json assemble_report_noinit.json artifacts/ 2>/dev/null || true
           cd artifacts
           for F in *.img; do zip -9 "${F%.img}.zip" "$F"; done
           sha256sum * > sha256sums.txt
@@ -690,9 +713,17 @@ jobs:
             cat sha256sums.txt
             echo '```'
             echo
-            echo "FLASH THIS: OrangeFox-${ARTIFACT_LABEL}-${DEVICE_CODENAME}-vendor_boot.img (hybrid)."
-            echo "*-plainbuild.img is for diagnosis only — it has no stock-preserving RECOVERY entry."
+            echo "TRY IN THIS ORDER:"
+            echo "1. Standard hybrid (flash this first):"
+            echo "   fastboot flash vendor_boot OrangeFox-${ARTIFACT_LABEL}-${DEVICE_CODENAME}-vendor_boot.img"
+            echo "   fastboot reboot recovery"
+            echo "2. If normal boot breaks with 1 (bootloader ignores the RECOVERY type bit):"
+            echo "   fastboot flash vendor_boot OrangeFox-${ARTIFACT_LABEL}-${DEVICE_CODENAME}-vendor_boot_noinit.img"
+            echo "3. Rescue (boot still fails after 1 or 2):"
+            echo "   fastboot flash vbmeta vbmeta_disabled.img"
+            echo "   then retry step 1; revert by reflashing the stock vbmeta.img"
             echo "Rollback: fastboot flash vendor_boot vendor_boot_stok.img"
+            echo "*-plainbuild.img is for diagnosis only."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifacts
