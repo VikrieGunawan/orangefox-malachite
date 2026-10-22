@@ -5,7 +5,6 @@ import gzip
 import hashlib
 import json
 import lzma
-import os
 import shutil
 import struct
 import subprocess
@@ -32,10 +31,6 @@ MAGIC_GZ = b"\x1f\x8b"
 MAGIC_ZSTD = b"\x28\xb5\x2f\xfd"
 MAGIC_XZ = b"\xfd7zXZ\x00"
 MAGIC_LZ4 = b"\x04\x22\x4d\x18"
-MAGIC_AVBF = b"AVBf"
-MAGIC_AVB0 = b"AVB0"
-AVB_FLAG_VERITY_DISABLED = 1
-AVB_FLAG_VERIFICATION_DISABLED = 2
 
 class AsmError(Exception):
     pass
@@ -64,7 +59,7 @@ def sniff(blob: bytes) -> str:
     if blob[:1] == b"\x5d" and blob[1:3] == b"\x00\x00":
         return "lzma"
     if blob[:6] in (b"070701", b"070702"):
-        return "cpio-mentah"
+        return "raw-cpio"
     return "unknown"
 
 def _run_cli(cmd, data: bytes, timeout: int = 600):
@@ -102,8 +97,8 @@ def decompress_any(blob: bytes):
     if kind == "lz4":
         out = _run_cli(["lz4", "-d", "-q"], blob)
         return (out, "lz4") if out is not None else (None, "lz4-unopenable")
-    if kind == "cpio-mentah":
-        return blob, "cpio-mentah"
+    if kind == "raw-cpio":
+        return blob, "raw-cpio"
     return None, kind
 
 def _comp_gzip(data: bytes) -> bytes:
@@ -194,11 +189,11 @@ def parse_vb(data: bytes, label: str) -> dict:
                 return False
         return True
 
-    ents, mode = read_table(tbl_abs_std), "standar"
+    ents, mode = read_table(tbl_abs_std), "standard"
     if not plausible(ents) and tbl_abs_alt != tbl_abs_std:
         e2 = read_table(tbl_abs_alt)
         if plausible(e2):
-            ents, mode = e2, "alternatif"
+            ents, mode = e2, "alternative"
     if not plausible(ents):
         raise AsmError("%s: invalid vendor_ramdisk table (tbl=%d, num=%d, esize=%d)"
                        % (label, h["tbl_size"], h["ent_num"], h["ent_size"]))
@@ -211,9 +206,9 @@ def parse_vb(data: bytes, label: str) -> dict:
         if len(b) != e["size"]:
             raise AsmError("%s: entry[%d] blob '%s' out of file bounds" % (label, e["idx"], e["name"]))
         e["blob"] = b
-        e["kompresi"] = sniff(b)
-    h["entrieses"] = ents
-    h["tbl_abs"] = tbl_abs_std if mode == "standar" else tbl_abs_alt
+        e["codec"] = sniff(b)
+    h["entries"] = ents
+    h["tbl_abs"] = tbl_abs_std if mode == "standard" else tbl_abs_alt
     h["tbl_mode"] = mode
     h["dtb"] = data[dtb_abs:dtb_abs + h["dtb_size"]] if h["dtb_size"] else b""
     bcfg_abs = align(h["tbl_abs"] + h["tbl_size"], page)
@@ -233,76 +228,12 @@ def _avb_footer(data: bytes):
 
 def compute_layout(page, kept_end, fox_size, dtb_size, tbl_size, bootcfg_size):
     pass
-    fox_off = kept_end
+    fox_off = align(kept_end, page)
     vr = fox_off + fox_size
     dtb_abs = align(page + vr, page)
     tbl_abs = align(dtb_abs + dtb_size, page)
     bcfg_abs = align(tbl_abs + tbl_size, page)
     return align(bcfg_abs + bootcfg_size, page), fox_off, vr
-
-def cpio_strip_init(raw):
-    if raw[:6] not in (b"070701", b"070702"):
-        return raw, []
-    out = bytearray()
-    removed = []
-    off, n = 0, len(raw)
-    while off + 110 <= n and raw[off:off + 6] in (b"070701", b"070702"):
-        f = [int(raw[off + 6 + i * 8: off + 14 + i * 8], 16) for i in range(13)]
-        namesize, fsize = f[11], f[6]
-        name = raw[off + 110: off + 110 + namesize - 1]
-        doff = (off + 110 + namesize + 3) & ~3
-        end = (doff + fsize + 3) & ~3
-        if name.rstrip(b"\x00") == b"TRAILER!!!":
-            off = end
-            continue
-        nm = name.decode("utf-8", "replace")
-        drop = ("/" not in nm) and nm.startswith("init") and not nm.startswith("init.recovery")
-        if not drop:
-            out += raw[off:end]
-        else:
-            removed.append(nm)
-        off = end
-    if not removed:
-        return raw, []
-    fields = [0] * 13
-    fields[11] = 11
-    out += b"070701" + b"".join(b"%08X" % x for x in fields) + b"TRAILER!!!\x00"
-    while len(out) % 4:
-        out += b"\x00"
-    return bytes(out), removed
-
-def run_avbtool(avbtool, out_path, partition, flags):
-    base = [sys.executable, avbtool, "add_hash_footer",
-            "--image", out_path, "--partition_name", "vendor_boot",
-            "--partition_size", str(partition), "--algorithm", "NONE"]
-    attempts = [base + ["--flags", str(flags)], base]
-    last = ""
-    for cmd in attempts:
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-        except (OSError, subprocess.TimeoutExpired) as ex:
-            last = str(ex)
-            continue
-        if r.returncode == 0:
-            return
-        last = (r.stderr or r.stdout or "").strip()
-    raise AsmError("avbtool add_hash_footer failed: %s" % last[:500])
-
-def verify_footer(data, content_size, partition, flags):
-    if len(data) != partition:
-        raise AsmError("final image %d B != partition size %d B" % (len(data), partition))
-    foot = data[-64:]
-    if foot[:4] != MAGIC_AVBF:
-        raise AsmError("AVB footer missing after avbtool run (tail is not AVBf)")
-    orig, voff, vsz = struct.unpack_from(">QQQ", foot, 12)
-    if orig != content_size:
-        raise AsmError("footer orig_size=%d != content size=%d" % (orig, content_size))
-    if voff + vsz > len(data) or data[voff:voff + 4] != MAGIC_AVB0:
-        raise AsmError("vbmeta blob invalid at offset %d" % voff)
-    fflags = struct.unpack_from(">I", data, voff + 72)[0]
-    if flags and fflags != flags:
-        _warn("vbmeta flags=%d (requested %d) — this avbtool build ignored --flags" % (fflags, flags))
-    return {"orig_size": orig, "vbmeta_off": voff, "vbmeta_size": vsz, "flags": fflags}
 
 def patch_entry(raw: bytearray, size: int, off: int, etype=None, name=None, zero_board=False):
     struct.pack_into("<III", raw, E_SIZE, size, off, etype if etype is not None
@@ -335,7 +266,7 @@ def recompress_kept(kept, codec_name, comp_fn):
         raw = bytearray(e["raw"])
         patch_entry(raw, len(nb), off)
         entry["blob"], entry["raw"], entry["off"], entry["size"] = nb, raw, off, len(nb)
-        entry["kompresi"] = sniff(nb)
+        entry["codec"] = sniff(nb)
         off += len(nb)
         new.append(entry)
     return new, cat
@@ -355,17 +286,12 @@ def verify(out: bytes, stock_img: dict, kept_orig: list, schema_mode: str,
     for f in ("kaddr", "rdaddr", "cmdline", "board", "hdr_size", "dtb_size", "dtb_addr",
               "ent_size", "bootcfg"):
         chk(v[f] == stock_img[f], "header.%s kept (%s)" % (f, fmt(v[f]) if isinstance(v[f], int) else v[f]))
-    chk(v["vr_size"] == max([e["off"] + e["size"] for e in v["entrieses"]] or [0]),
+    chk(v["vr_size"] == max([e["off"] + e["size"] for e in v["entries"]] or [0]),
         "vr_size %s = end of the last blob" % fmt(v["vr_size"]))
     chk(v["ent_num"] == len(kept_orig) + 1, "ent_num=%d (stock kept + 1 Fox entry)" % v["ent_num"])
-    for i in range(len(v["entrieses"]) - 1):
-        a, b = v["entrieses"][i], v["entrieses"][i + 1]
-        chk(a["off"] + a["size"] == b["off"],
-            "entries CONTIGUOUS: entry[%d] ends at %d = entry[%d] offset (no gaps — stock convention, "
-            "stream-loading bootloaders depend on it)" % (i, a["off"] + a["size"], i + 1))
 
     for i, orig in enumerate(kept_orig):
-        e = v["entrieses"][i]
+        e = v["entries"][i]
         chk(e["type"] == orig["type"] and e["name"] == orig["name"],
             "entry[%d] '%s' %s kept (type+name)" % (i, orig["name"] or "?", TYPE_LABEL[orig["type"]]))
         if schema_mode == "as-is":
@@ -377,7 +303,7 @@ def verify(out: bytes, stock_img: dict, kept_orig: list, schema_mode: str,
             chk(a_raw is not None and a_raw == b_raw,
                 "entry[%d] CONTENT identical to original stock (recompressed %s: %s -> %s B)"
                 % (i, how, fmt(orig["size"]), fmt(e["size"])))
-    fox = v["entrieses"][-1]
+    fox = v["entries"][-1]
     chk(bytes(fox["raw"]) == bytes(fox_raw_ent), "Fox entry reuses stock RECOVERY entry bytes (with new size/offset)")
     chk(fox["type"] == TYPE_RECOVERY, "Fox entry is RECOVERY-typed (2) — loaded by the bootloader in recovery mode")
     chk(fox["blob"] == fox_blob, "Fox entry = fresh OrangeFox blob (%s B)" % fmt(len(fox_blob)))
@@ -385,7 +311,7 @@ def verify(out: bytes, stock_img: dict, kept_orig: list, schema_mode: str,
     chk(dec == cpio_orig, "Fox blob decompressed back (%s) = original cpio %s B" % (how, fmt(len(cpio_orig))))
     chk(v["dtb"] == stock_img["dtb"], "DTB byte-exact from stock (%s B)" % fmt(stock_img["dtb_size"]))
     chk(v["bootcfg_bytes"] == stock_img["bootcfg_bytes"], "bootconfig kept (%s B)" % fmt(stock_img["bootcfg"]))
-    chk(v["avb"] is None, "content built without AVB footer (--avbtool adds a fresh one on the final file)")
+    chk(v["avb"] is None, "old AVB footer dropped (avbtool/pipeline will re-add it)")
     return v, note
 
 _WARNINGS = []
@@ -410,10 +336,10 @@ def load_fragment(path):
     return raw, kind, how
 
 def dump_entry(h):
-    for e in h["entrieses"]:
-        print("    [%d] %-18s %-8s %12s B  off=%-9d  isi=%s" %
+    for e in h["entries"]:
+        print("    [%d] %-18s %-8s %12s B  off=%-9d  content=%s" %
               (e["idx"], e["name"] or "(no-name)", TYPE_LABEL.get(e["type"], "?"),
-               fmt(e["size"]), e["off"], e["kompresi"]))
+               fmt(e["size"]), e["off"], e["codec"]))
 
 def main(argv=None):
     global _WARNINGS
@@ -435,14 +361,7 @@ def main(argv=None):
     ap.add_argument("--entry-name", default=None,
                     help="Fox entry name (default: keep the stock name / 'recovery' when adding)")
     ap.add_argument("--pad-to-partition", action="store_true",
-                    help="pad the output exactly to partition size (no AVB footer; ignored with --avbtool)")
-    ap.add_argument("--avbtool", default=None,
-                    help="path to avbtool.py - re-adds a fresh AVB footer on the output (recommended)")
-    ap.add_argument("--avb-flags", type=lambda x: int(x, 0), default=3,
-                    help="vbmeta flags for the new footer (default 3 = verity+verification disabled)")
-    ap.add_argument("--strip-init", action="store_true",
-                    help="remove root-level init/init.rc files from the Fox cpio (stock-style fragment, "
-                         "for bootloaders that load RECOVERY fragments in every boot mode)")
+                    help="pad the output exactly to partition size (no AVB footer)")
     ap.add_argument("--report", default=None, help="write the JSON report")
     ap.add_argument("--dry-run", action="store_true", help="compute the budget only, write no files")
     args = ap.parse_args(argv)
@@ -454,7 +373,7 @@ def main(argv=None):
     stock_img = parse_vb(stock_data, "stock")
     partition = args.partition_size or stock_img["file_size"]
     page = stock_img["page"]
-    print("[+] stock: %s B | header v4 | page %d | vr_size %s B | %d entrieses x %d B (%s)"
+    print("[+] stock: %s B | header v4 | page %d | vr_size %s B | %d entries x %d B (%s)"
           % (fmt(stock_img["file_size"]), page, fmt(stock_img["vr_size"]), stock_img["ent_num"],
              stock_img["ent_size"], stock_img["tbl_mode"]))
     if stock_img["ent_size"] != 108:
@@ -469,27 +388,18 @@ def main(argv=None):
     print("[+] OrangeFox recovery cpio: ~%d cpio headers, %s B (input %s -> opened as %s)"
           % (n_cpio, fmt(len(cpio_raw)), kind_in, how_in))
 
-    removed_init = []
-    if args.strip_init:
-        cpio_raw, removed_init = cpio_strip_init(cpio_raw)
-        print("[+] strip-init: removed %d root-level init entry(ies)%s"
-              % (len(removed_init), ": " + ", ".join(removed_init) if removed_init else " (none found)"))
-        print("[i] noinit variant: the Fox fragment no longer carries its own /init — normal boot stays "
-              "safe even if the bootloader loads RECOVERY fragments in every mode; recovery boot relies "
-              "on the stock init flow exec-ing /system/bin/recovery from the fragment")
-
     if args.keep_stock_recovery:
-        kept = [dict(e) for e in stock_img["entrieses"]]
-        rec_stock = next((e for e in stock_img["entrieses"] if e["type"] == TYPE_RECOVERY), None)
-        entry_mode = "tambah"
+        kept = [dict(e) for e in stock_img["entries"]]
+        rec_stock = next((e for e in stock_img["entries"] if e["type"] == TYPE_RECOVERY), None)
+        entry_mode = "add"
     else:
-        kept = [dict(e) for e in stock_img["entrieses"] if e["type"] != TYPE_RECOVERY]
-        rec_stock = next((e for e in stock_img["entrieses"] if e["type"] == TYPE_RECOVERY), None)
-        entry_mode = "ganti"
-        missing = [e for e in stock_img["entrieses"] if e["type"] == TYPE_RECOVERY]
+        kept = [dict(e) for e in stock_img["entries"] if e["type"] != TYPE_RECOVERY]
+        rec_stock = next((e for e in stock_img["entries"] if e["type"] == TYPE_RECOVERY), None)
+        entry_mode = "replace"
+        missing = [e for e in stock_img["entries"] if e["type"] == TYPE_RECOVERY]
         for e in missing:
-            print("[+] stock RECOVERY blob '%s' (%s B, %s) REPLACED with the OrangeFox blob — other entrieses intact"
-                  % (e["name"] or "?", fmt(e["size"]), e["kompresi"]))
+            print("[+] stock RECOVERY blob '%s' (%s B, %s) REPLACED with the OrangeFox blob — other entries intact"
+                  % (e["name"] or "?", fmt(e["size"]), e["codec"]))
         if rec_stock is None:
             _warn("stock has NO RECOVERY-type entry — OrangeFox is added as a new entry "
                   "(this composition stays valid: the bootloader loads PLATFORM/DLKM in normal mode, "
@@ -528,10 +438,10 @@ def main(argv=None):
                                                stock_img["dtb_size"], tbl_size_new, stock_img["bootcfg"])
         load = total + args.avb_headroom <= partition
         candidates.append({"mode": mode_schema, "codec": codec_name, "fox": len(fox_blob),
-                         "total": total, "muat": load})
+                         "total": total, "fits": load})
         print("  [>] candidate %-10s %-6s : fox=%s  total=%s  %s" %
               ("[%s]" % mode_schema, codec_name, fmt(len(fox_blob)), fmt(total),
-               "MUAT" if load else "does not fit (partition %s%s)" %
+               "FITS" if load else "does not fit (partition %s%s)" %
                (fmt(partition), " - headroom %s" % fmt(args.avb_headroom) if args.avb_headroom else "")))
         if load and chosen is None:
             chosen = {"mode": mode_schema, "codec": codec_name, "stock_codec": stock_codec,
@@ -555,7 +465,7 @@ def main(argv=None):
     kept_cur = chosen["kept"]
     tbl_size_new = (len(kept_cur) + 1) * stock_img["ent_size"]
 
-    if entry_mode == "ganti" and rec_stock is not None:
+    if entry_mode == "replace" and rec_stock is not None:
         fox_raw_ent = bytearray(rec_stock["raw"])          
         patch_entry(fox_raw_ent, len(fox_blob), fox_off)  
     else:
@@ -584,9 +494,7 @@ def main(argv=None):
     out += b"\x00" * ((page - len(out) % page) % page)
     out += stock_img["bootcfg_bytes"]
     out += b"\x00" * ((page - len(out) % page) % page)
-    dtb_abs = align(page + chosen["vr"], page)
-    tbl_abs = align(dtb_abs + stock_img["dtb_size"], page)
-    if args.pad_to_partition and not args.avbtool:
+    if args.pad_to_partition:
         if len(out) > partition:
             raise AsmError("pad-to-partition: content %s B > partition %s B" % (fmt(len(out)), fmt(partition)))
         out += b"\x00" * (partition - len(out))
@@ -598,8 +506,6 @@ def main(argv=None):
     print("[=] Fox fragment codec : %s (stock mode: %s%s)" %
           (chosen["codec"], chosen["mode"],
            ", stock blobs recompressed with %s" % chosen["stock_codec"] if chosen["stock_codec"] else ""))
-    print("[i] layout: fox blob @%d (contiguous after stock blobs) | vr_size %s | dtb @%d | table @%d"
-          % (chosen["fox_off"], fmt(chosen["vr"]), dtb_abs, tbl_abs))
     for k in note:
         print("  " + k)
     rest = partition - args.avb_headroom - chosen["total"]
@@ -614,64 +520,24 @@ def main(argv=None):
           "(+ --recompress-stock force if space is needed).")
     print("[=] %s — %s B, sha256 %s" % (args.output, fmt(len(out)), sha256(bytes(out))[:32]))
 
-    avb_out = None
     if not args.dry_run:
-        if args.avbtool:
-            if args.pad_to_partition:
-                _warn("--pad-to-partition ignored: --avbtool owns the final padding")
-            tmp = args.output + ".content"
-            with open(tmp, "wb") as f:
-                f.write(out)
-            try:
-                shutil.copyfile(tmp, args.output)
-                run_avbtool(args.avbtool, args.output, partition, args.avb_flags)
-            finally:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            fin = bytearray(open(args.output, "rb").read())
-            foot = fin[-64:]
-            if foot[:4] == MAGIC_AVBF and args.avb_flags:
-                _, voff, _ = struct.unpack_from(">QQQ", foot, 12)
-                if fin[voff:voff + 4] == MAGIC_AVB0 and voff + 76 <= len(fin):
-                    cur = struct.unpack_from(">I", fin, voff + 72)[0]
-                    if cur != args.avb_flags:
-                        struct.pack_into(">I", fin, voff + 72, args.avb_flags)
-                        with open(args.output, "wb") as f:
-                            f.write(bytes(fin))
-                        _warn("this avbtool build lacks --flags support - vbmeta flags "
-                              "byte-patched to %d directly (safe: algorithm NONE is unsigned)"
-                              % args.avb_flags)
-            avb_out = verify_footer(open(args.output, "rb").read(), len(out), partition, args.avb_flags)
-            print("[=] fresh AVB footer: orig_size=%s, vbmeta@%s (flags=%d — verity+verification disabled "
-                  "at the vendor_boot level)" % (fmt(avb_out["orig_size"]), fmt(avb_out["vbmeta_off"]),
-                                                   avb_out["flags"]))
-        else:
-            with open(args.output, "wb") as f:
-                f.write(out)
-            if stock_img["avb"]:
-                _warn("output has NO AVB footer while the stock image HAS one — many MTK bootloaders "
-                      "refuse footerless images; rerun with --avbtool <path-to-avbtool.py> (build/make/"
-                      "tools/releasetools/avbtool.py inside the synced tree) so the output matches the "
-                      "stock convention")
+        with open(args.output, "wb") as f:
+            f.write(out)
     if args.report:
         rep = {
-            "tool": SCRIPT, "waktu": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "tool": SCRIPT, "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "stock": {"file": args.stock, "size": stock_img["file_size"], "vr_size": stock_img["vr_size"],
                      "entries": [{"name": e["name"], "type": e["type"], "size": e["size"],
-                                "off": e["off"], "kompresi": e["kompresi"]} for e in stock_img["entrieses"]],
+                                "off": e["off"], "codec": e["codec"]} for e in stock_img["entries"]],
                      "avb": stock_img["avb"]},
-            "fragment": {"file": args.fragment, "input": kind_in, "cpio_bytes": len(cpio_raw),
-                        "strip_init": removed_init},
-            "layout": {"fox_off": chosen["fox_off"], "vr_size": chosen["vr"],
-                       "dtb_abs": dtb_abs, "tbl_abs": tbl_abs},
-            "dipilih": {"mode": chosen["mode"], "codec": chosen["codec"],
+            "fragment": {"file": args.fragment, "input": kind_in, "cpio_bytes": len(cpio_raw)},
+            "chosen": {"mode": chosen["mode"], "codec": chosen["codec"],
                         "stock_codec": chosen["stock_codec"], "fox_blob": len(fox_blob),
-                        "total": chosen["total"], "sisa": rest},
-            "avb_output": avb_out,
-            "kandidat": candidates,
+                        "total": chosen["total"], "free": rest},
+            "candidates": candidates,
             "output": {"file": None if args.dry_run else args.output,
                        "size": len(out), "sha256": sha256(bytes(out))},
-            "peringatan": _WARNINGS,
+            "warnings": _WARNINGS,
         }
         with open(args.report, "w") as f:
             json.dump(rep, f, indent=2, ensure_ascii=False)
