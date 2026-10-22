@@ -1,735 +1,687 @@
-name: Build OrangeFox Recovery (malachite)
+from __future__ import annotations
 
-on:
-  workflow_dispatch:
-  push:
-    branches: [ main, master ]
+import argparse
+import gzip
+import hashlib
+import json
+import lzma
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import time
 
-env:
-  MANIFEST_URL: https://gitlab.com/OrangeFox/Manifest.git
-  MANIFEST_BRANCH: fox_16.0
-  DEVICE_TREE_URL: https://github.com/mytiantian001/android_device_xiaomi_malachite_twrp
-  DEVICE_TREE_BRANCH: A16
-  DEVICE_PATH: device/xiaomi/malachite
-  DEVICE_CODENAME: malachite
-  BUILD_TARGET: vendorbootimage
-  MAINTAINER: VikrieGunawan
-  FOX_MAINTAINER_PATCH_VERSION: "0"
-  FOX_BUILD_TYPE: Beta
-  ARTIFACT_LABEL: R12.0_0-Beta
-  OTA_MIRRORS: >-
-    https://bigota.d.miui.com/OS2.0.208.0.VOOMIXM/malachite_global-ota_full-OS2.0.208.0.VOOMIXM-user-15.0-4b22dfd9d8.zip
-    https://hugeota.d.miui.com/OS2.0.208.0.VOOMIXM/malachite_global-ota_full-OS2.0.208.0.VOOMIXM-user-15.0-4b22dfd9d8.zip
-  STOCK_SIZE: "67108864"
+SCRIPT = "hybrid_assembler.py v3"
 
-concurrency:
-  group: orangefox-malachite-build
-  cancel-in-progress: true
+MAGIC_VB = b"VNDRBOOT"
+MAGIC_DTB = b"\xd0\x0d\xfe\xed"
+HDR_V4_SIZE = 2128
 
-jobs:
-  build:
-    name: Build OrangeFox R12.0_0-Beta (malachite)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
+OFF_VER, OFF_PAGE, OFF_KADDR, OFF_RDADDR, OFF_VRSIZE = 8, 12, 16, 20, 24
+OFF_TAGS, OFF_NAME, OFF_HDRSIZE, OFF_DTBSIZE, OFF_DTBADDR = 2076, 2080, 2096, 2100, 2104
+OFF_TBLSIZE, OFF_ENTNUM, OFF_ENTSIZE, OFF_BOOTCFG = 2112, 2116, 2120, 2124
 
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+E_SIZE, E_OFF, E_TYPE, E_NAME, E_BOARD = 0, 4, 8, 12, 44
+MIN_ENT_SIZE = 44
 
-      - name: Free up disk space and set up swap (pre-sync)
-        run: |
-          set -e
-          sudo rm -rf /usr/share/dotnet /usr/share/swift /opt/ghc /usr/local/.ghcup \
-                      /opt/hostedtoolcache /usr/local/lib/android /opt/pipx \
-                      /opt/az /usr/share/miniconda /opt/conda /usr/local/lib/node_modules \
-                      /usr/lib/jvm/temurin-8-jdk-amd64 /usr/lib/jvm/temurin-11-jdk-amd64
-          sudo systemctl stop docker docker.socket containerd >/dev/null 2>&1 || true
-          sudo rm -rf /var/lib/docker /var/lib/containerd
-          sudo docker image prune -af >/dev/null 2>&1 || true
-          sudo apt-get clean
-          sudo journalctl --vacuum-size=50M >/dev/null 2>&1 || true
-          echo "Disk after cleanup:"
-          df -h /
-          if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile'; then
-            echo "Existing /swapfile is active — switching it off before resizing."
-            sudo swapoff /swapfile 2>/dev/null || sudo swapoff -a || true
-          fi
-          sudo rm -f /swapfile
-          if ! sudo fallocate -l 16G /swapfile 2>/tmp/fallocate.err; then
-            echo "fallocate failed ($(cat /tmp/fallocate.err)) — falling back to dd."
-            sudo rm -f /swapfile
-            sudo dd if=/dev/zero of=/swapfile bs=1M count=16384 status=none
-          fi
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          echo "Memory after adding 16 GB swap:"
-          free -h
-          swapon --show
+TYPE_NONE, TYPE_PLATFORM, TYPE_RECOVERY, TYPE_DLKM = 0, 1, 2, 3
+TYPE_LABEL = {0: "NONE", 1: "PLATFORM", 2: "RECOVERY", 3: "DLKM"}
 
-      - name: Install build dependencies
-        run: |
-          set -e
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq git zip curl build-essential libgl1-mesa-dev \
-            libxml2-utils xsltproc unzip rsync m4 >/dev/null || \
-            sudo apt-get install -y -qq git zip curl build-essential libgl-dev \
-            libxml2-utils xsltproc unzip rsync m4 >/dev/null
-          sudo apt-get install -y -qq libncurses5 >/dev/null 2>&1 || \
-            sudo apt-get install -y -qq libncurses6 >/dev/null
-          sudo curl -s https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
-          sudo chmod a+x /usr/local/bin/repo
-          git config --global user.name "OrangeFox Builder"
-          git config --global user.email "builder@users.noreply.github.com"
+MAGIC_GZ = b"\x1f\x8b"
+MAGIC_ZSTD = b"\x28\xb5\x2f\xfd"
+MAGIC_XZ = b"\xfd7zXZ\x00"
+MAGIC_LZ4 = b"\x04\x22\x4d\x18"
+MAGIC_AVBF = b"AVBf"
+MAGIC_AVB0 = b"AVB0"
+AVB_FLAG_VERITY_DISABLED = 1
+AVB_FLAG_VERIFICATION_DISABLED = 2
 
-      - name: Fetch stock vendor_boot from Xiaomi OTA (fail fast, before the long sync)
-        run: |
-          set -e
-          cd "$GITHUB_WORKSPACE"
-          sudo apt-get install -y -qq lz4 zstd xz-utils >/dev/null 2>&1 || true
-          mkdir -p stock
-          STOCK="stock/vendor_boot_stok.img"
-          OK=0
-          for U in $OTA_MIRRORS; do
-            echo "Trying mirror: $U"
-            if python3 fetch_stock_vb.py "$U" "$STOCK" --partitions vendor_boot; then
-              echo "Mirror OK: $U"
-              OK=1
-              break
-            fi
-            echo "Mirror failed: $U"
-            rm -f "$STOCK"
-          done
-          if [ "$OK" -ne 1 ]; then
-            echo "ERROR: every Xiaomi OTA mirror failed — the OTA file name may have changed."
-            echo "Update OTA_MIRRORS in this workflow with the new OS2.0.208.0.VOOMIXM URL."
-            exit 1
-          fi
-          SZ=$(stat -c %s "$STOCK" 2>/dev/null || echo 0)
-          if [ "$SZ" -ne "$STOCK_SIZE" ]; then
-            echo "ERROR: stock vendor_boot is $SZ bytes (expected $STOCK_SIZE). Refusing to continue."
-            exit 1
-          fi
-          echo "=== stock vendor_boot OK ($SZ bytes) ==="
-          sha256sum "$STOCK"
+class AsmError(Exception):
+    pass
 
-      - name: Sync OrangeFox source tree (fox_16.0)
-        run: |
-          set -e
-          echo "Sync started: $(date -u)"
-          mkdir -p workspace/fox_16.0
-          cd workspace/fox_16.0
-          repo init --depth=1 -u "$MANIFEST_URL" -b "$MANIFEST_BRANCH"
-          if repo manifest -o /tmp/combined_manifest.xml >/dev/null 2>/tmp/manifest_check.err; then
-            echo "Manifest parse: OK ($(grep -c '<project ' /tmp/combined_manifest.xml) projects after OrangeFox's own slimming)"
-          else
-            echo "WARNING: combined manifest does not parse. Upstream manifest hiccup?"
-            sed -n '1,5p' /tmp/manifest_check.err
-            echo "Attempting auto-fix for dangling <remove-project> entries..."
-            for ATTEMPT in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-              BAD=$(sed -n 's/.*non-existent project: \(<remove-project[^>]*\/>\).*/\1/p' /tmp/manifest_check.err | head -n1)
-              if [ -z "$BAD" ]; then
-                echo "No dangling remove-project identified; stopping auto-fix."
-                break
-              fi
-              echo "  stripping dangling entry: $BAD"
-              BAD="$BAD" python3 - <<'PYEOF'
-          import os, re, glob
-          bad = os.environ["BAD"]
-          m_path = re.search(r'path="([^"]*)"', bad)
-          m_name = re.search(r'name="([^"]*)"', bad)
-          key = (m_path.group(1) if m_path else None) or (m_name.group(1) if m_name else None)
-          if not key:
-              raise SystemExit(0)
-          for f in glob.glob(".repo/manifests/*.xml"):
-              try:
-                  with open(f, encoding="utf-8", errors="replace") as fh:
-                      lines = fh.readlines()
-              except OSError:
-                  continue
-              kept = [l for l in lines if not ("remove-project" in l and key in l)]
-              if len(kept) != len(lines):
-                  with open(f, "w", encoding="utf-8") as fh:
-                      fh.writelines(kept)
-                  print(f"    stripped from {f}")
-          PYEOF
-              if repo manifest -o /tmp/combined_manifest.xml >/dev/null 2>/tmp/manifest_check.err; then
-                echo "  manifest parses cleanly now."
-                break
-              fi
-            done
-            git -C .repo/manifests add -A >/dev/null 2>&1 || true
-            git -C .repo/manifests commit -qm "CI: strip dangling remove-project entries" >/dev/null 2>&1 || true
-            if ! repo manifest -o /tmp/combined_manifest.xml >/dev/null 2>/tmp/manifest_check.err; then
-              echo "ERROR: manifest still unparseable after auto-fix. Full error:"
-              cat /tmp/manifest_check.err
-              exit 1
-            fi
-            echo "Manifest parse: OK after auto-fix ($(grep -c '<project ' /tmp/combined_manifest.xml) projects)"
-          fi
-          python3 - <<'PYEOF'
-          import xml.etree.ElementTree as ET
-          tree = ET.parse("/tmp/combined_manifest.xml")
-          root = tree.getroot()
-          remotes = {r.get("name"): (r.get("fetch") or "").rstrip("/")
-                     for r in root.findall("remote")}
-          default_remote = None
-          d = root.find("default")
-          if d is not None:
-              default_remote = d.get("remote")
-          out = open("/tmp/fox_pins.tsv", "w")
-          count = 0
-          for el in root.findall("project"):
-              name = el.get("name") or el.get("path")
-              remote = el.get("remote") or default_remote
-              fetch = remotes.get(remote, "")
-              if "gitlab.com/OrangeFox" not in fetch:
-                  continue
-              url = fetch + "/" + name
-              rev = el.get("revision") or ""
-              out.write(f"{name}|{url}|{rev}\n")
-              count += 1
-          out.close()
-          print(f"Probing {count} OrangeFox-remote projects for reachability...")
-          PYEOF
-          : > /tmp/fox_probe_result.tsv
-          while IFS='|' read -r NAME URL REV; do
-            OK=0
-            for TRY in 1 2; do
-              if [ "${#REV}" -eq 40 ]; then
-                rm -rf /tmp/pin_probe
-                if git init -q /tmp/pin_probe 2>/dev/null && \
-                   timeout 120 git -C /tmp/pin_probe fetch --depth=1 "$URL" "$REV" >/dev/null 2>&1; then
-                  OK=1
-                fi
-                rm -rf /tmp/pin_probe
-              else
-                if timeout 60 git ls-remote "$URL" HEAD >/dev/null 2>&1; then
-                  OK=1
-                fi
-              fi
-              [ "$OK" -eq 1 ] && break
-              sleep 3
-            done
-            echo "$NAME|$OK" >> /tmp/fox_probe_result.tsv
-            if [ "$OK" -eq 1 ]; then
-              echo "  reachable:   $NAME"
-            else
-              echo "  UNREACHABLE: $NAME (repo private/missing, or pinned revision not fetchable)"
-            fi
-          done < /tmp/fox_pins.tsv
-          python3 - <<'PYEOF'
-          import os
-          probe = {}
-          for line in open("/tmp/fox_probe_result.tsv"):
-              name, ok = line.strip().split("|")
-              probe[name] = ok == "1"
-          REMOVABLE_OK = {
-              "external/libarchive", "external/libfuse3", "external/fox-go",
-              "external/rclone", "external/ttyd", "external/libuv",
-              "external/json-c", "external/libwebsockets",
-          }
-          removals = set()
-          for name, ok in probe.items():
-              if not ok and name in REMOVABLE_OK:
-                  removals.add(name)
-          if "external/fox-go" in removals:
-              removals.add("external/rclone")
-          for name, ok in probe.items():
-              if not ok and name not in REMOVABLE_OK:
-                  print(f"  WARNING: {name} probe failed but is not on the removable list; keeping it.")
-          os.makedirs(".repo/local_manifests", exist_ok=True)
-          overlay = ".repo/local_manifests/ci-remove-unreachable-fox-repos.xml"
-          if removals:
-              with open(overlay, "w") as f:
-                  f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-                  f.write("<manifest>\n")
-                  f.write("    <!-- CI-generated: not publicly fetchable at sync time.\n")
-                  f.write("         Safe to remove (no build rule references them). -->\n")
-                  for name in sorted(removals):
-                      f.write(f'    <remove-project name="{name}" />\n')
-                  f.write("</manifest>\n")
-              print("Wrote repair overlay:", overlay)
-              for name in sorted(removals):
-                  print("  removed from sync:", name)
-          else:
-              if os.path.exists(overlay):
-                  os.remove(overlay)
-              print("All OrangeFox repos reachable — no repair overlay needed.")
-          PYEOF
-          if [ -s .repo/local_manifests/ci-remove-unreachable-fox-repos.xml ]; then
-            if repo manifest -o /tmp/combined_manifest2.xml >/dev/null 2>/tmp/repair_check.err; then
-              echo "Manifest after repair: OK ($(grep -c '<project ' /tmp/combined_manifest2.xml) projects)"
-            else
-              echo "ERROR: manifest unparseable after repair overlay:"
-              tail -n 5 /tmp/repair_check.err
-              exit 1
-            fi
-          fi
-          ( while true; do sleep 180; echo "[disk-watchdog] $(date -u) $(df -h / | tail -n 1)"; done ) &
-          WATCHDOG_PID=$!
-          trap 'kill "$WATCHDOG_PID" 2>/dev/null || true' EXIT
-          SYNC_OK=0
-          for ATTEMPT in 1 2 3; do
-            case "$ATTEMPT" in
-              1) FLAGS="-c -j8 --no-tags --fail-fast --retry-fetches=3 --no-clone-bundle" ;;
-              2) FLAGS="-c -j4 --no-tags --fail-fast --retry-fetches=5 --no-clone-bundle --force-sync" ;;
-              3) FLAGS="-c -j2 --no-tags --fail-fast --retry-fetches=5 --no-clone-bundle --force-sync" ;;
-            esac
-            echo "=== repo sync attempt $ATTEMPT: repo sync $FLAGS ==="
-            repo sync $FLAGS 2>&1 | tee "/tmp/sync_attempt_$ATTEMPT.log"
-            SYNC_RC=${PIPESTATUS[0]}
-            if [ "$SYNC_RC" -eq 0 ]; then
-              SYNC_OK=1
-              break
-            fi
-            echo "=== attempt $ATTEMPT failed (exit code $SYNC_RC). Underlying git errors: ==="
-            grep -iE "fatal:|error:|unable to remote fetch|could not read Username" "/tmp/sync_attempt_$ATTEMPT.log" | sort -u | tail -n 25 || true
-            echo "=== resources at failure: ==="
-            free -h || true
-            df -h /
-            sudo apt-get clean || true
-          done
-          kill "$WATCHDOG_PID" 2>/dev/null || true
-          if [ "$SYNC_OK" -ne 1 ]; then
-            echo "ERROR: repo sync failed after 3 attempts (see the resource dumps above)."
-            exit 1
-          fi
-          echo "Sync finished: $(date -u)."
-          du -sh .repo 2>/dev/null || true
-          df -h /
+def align(x: int, p: int) -> int:
+    return (x + p - 1) // p * p
 
-      - name: Verify synced tree
-        run: |
-          set -e
-          cd workspace/fox_16.0
-          FAIL=0
-          if [ ! -f build/envsetup.sh ]; then
-            echo "ERROR: build/envsetup.sh is missing. repo sync did not complete correctly."
-            FAIL=1
-          fi
-          if [ ! -f vendor/twrp/config/common.mk ]; then
-            echo "ERROR: vendor/twrp/config/common.mk is missing (inherited by the device tree)."
-            FAIL=1
-          fi
-          if [ ! -d vendor/recovery ]; then
-            echo "ERROR: vendor/recovery is missing (OrangeFox build system layer)."
-            FAIL=1
-          fi
-          if [ "$FAIL" -eq 1 ]; then exit 1; fi
-          if [ ! -f vendorsetup.sh ]; then
-            echo "NOTE: root vendorsetup.sh is absent — normal for fox_16.0, continuing."
-          fi
-          echo "Synced tree verified."
-          ls | head -20
+def fmt(n: int) -> str:
+    return format(n, ",")
 
-      - name: Prepare device tree
-        run: |
-          set -e
-          cd "$GITHUB_WORKSPACE/workspace/fox_16.0"
-          git clone --depth=1 -b "$DEVICE_TREE_BRANCH" "$DEVICE_TREE_URL" "$DEVICE_PATH"
-          echo "Device tree cloned:"
-          ls -la "$DEVICE_PATH"
+def mib(n: float) -> str:
+    return "%.2f MiB" % (n / 1048576.0)
 
-      - name: Apply device patches to bootable/recovery
-        run: |
-          set -e
-          REPO_DIR="$GITHUB_WORKSPACE/workspace/fox_16.0"
-          PATCH="$REPO_DIR/$DEVICE_PATH/patches/0001-minuitwrp-skip-unavailable-aidl-haptics.patch"
-          if [ ! -f "$PATCH" ]; then
-            echo "No patch present, skipping."
-            exit 0
-          fi
-          if git -C "$REPO_DIR/bootable/recovery" apply --check "$PATCH" 2>/dev/null; then
-            git -C "$REPO_DIR/bootable/recovery" apply "$PATCH"
-            echo "Haptics patch applied to bootable/recovery."
-          elif patch -d "$REPO_DIR/bootable/recovery" -p1 --forward --dry-run < "$PATCH" >/dev/null 2>&1; then
-            patch -d "$REPO_DIR/bootable/recovery" -p1 --forward < "$PATCH"
-            echo "Haptics patch applied with patch(1)."
-          else
-            echo "WARNING: patch does not apply cleanly (likely already fixed upstream). Continuing."
-          fi
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
-          cd "$REPO_DIR"
-          python3 - <<'SOONGEOF'
-          import os, re
-          path = "build/soong/cmd/soong_build/main.go"
-          if not os.path.exists(path):
-              raise SystemExit("FAIL-FAST: %s not found - soong entry point moved "
-                               "upstream; cannot apply the memory-limit patch." % path)
-          src = open(path, encoding="utf-8").read()
-          if "debug.SetMemoryLimit" in src:
-              print("soong_build main.go already patched (debug.SetMemoryLimit present).")
-              raise SystemExit(0)
-          if '"runtime/debug"' not in src:
-              m = re.search(r'import \(\n', src)
-              if not m:
-                  raise SystemExit("FAIL-FAST: no 'import (' block found in %s" % path)
-              src = src[:m.end()] + '\t"runtime/debug"\n' + src[m.end():]
-          m = re.search(r'func main\(\) \{\n', src)
-          if not m:
-              raise SystemExit("FAIL-FAST: no 'func main() {' anchor found in %s" % path)
-          injection = ('\t// CI: hard Go heap limit - soong_ui launches this binary via '
-                       '"env -i" which strips GOMEMLIMIT, see workflow.\n'
-                       '\tdebug.SetMemoryLimit(14 << 30)\n\n')
-          src = src[:m.end()] + injection + src[m.end():]
-          open(path, "w", encoding="utf-8").write(src)
-          print("Patched %s -> debug.SetMemoryLimit(14 << 30)" % path)
-          SOONGEOF
-          echo "Patch verification (soong_build main.go):"
-          grep -n "SetMemoryLimit\|runtime/debug" build/soong/cmd/soong_build/main.go
+def sniff(blob: bytes) -> str:
+    if blob[:2] == MAGIC_GZ:
+        return "gzip"
+    if blob[:4] == MAGIC_ZSTD:
+        return "zstd"
+    if blob[:6] == MAGIC_XZ:
+        return "xz"
+    if blob[:4] == MAGIC_LZ4:
+        return "lz4"
+    if blob[:1] == b"\x5d" and blob[1:3] == b"\x00\x00":
+        return "lzma"
+    if blob[:6] in (b"070701", b"070702"):
+        return "cpio-mentah"
+    return "unknown"
 
-          python3 - <<'SABIEOF'
-          import os
-          path = "build/soong/cc/sabi.go"
-          if not os.path.exists(path):
-              raise SystemExit("FAIL-FAST: %s not found - upstream moved the ABI "
-                               "gate; cannot apply the SKIP_ABI_CHECKS patch." % path)
-          src = open(path, encoding="utf-8").read()
-          needle = 'ctx.Config().IsEnvTrue("SKIP_ABI_CHECKS")'
-          n = src.count(needle)
-          if n == 0:
-              if "SKIP_ABI_CHECKS" in src:
-                  raise SystemExit("FAIL-FAST: %s mentions SKIP_ABI_CHECKS in an "
-                                   "unexpected form; the escape hatch changed "
-                                   "upstream - refusing to guess." % path)
-              print("sabi.go already patched (ABI gate disabled).")
-              raise SystemExit(0)
-          if n != 2:
-              raise SystemExit("FAIL-FAST: expected 2 occurrences of the ABI escape "
-                               "hatch in %s, found %d - refusing to blind-patch." % (path, n))
-          src = src.replace(needle, 'true /* CI: ABI gate disabled */')
-          open(path, "w", encoding="utf-8").write(src)
-          print("Patched %s: ABI gate disabled at both mutator sites." % path)
-          SABIEOF
-          echo "Patch verification (soong cc/sabi.go):"
-          grep -n "CI: ABI gate disabled" build/soong/cc/sabi.go
+def _run_cli(cmd, data: bytes, timeout: int = 600):
+    try:
+        r = subprocess.run(cmd, input=data, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode == 0 and r.stdout:
+        return r.stdout
+    return None
 
-      - name: Add OrangeFox device configuration
-        run: |
-          set -e
-          REPO_DIR="$GITHUB_WORKSPACE/workspace/fox_16.0"
-          sed -i \
-            -e 's/\bOF_VIRTUAL_AB_DEVICE\b/FOX_VIRTUAL_AB_DEVICE/g' \
-            -e 's/\bOF_AB_DEVICE\b/FOX_AB_DEVICE/g' \
-            -e 's/\bOF_PATCH_VBMETA_FLAG\b/FOX_PATCH_VBMETA_FLAG/g' \
-            -e 's/\bOF_VANILLA_BUILD\b/FOX_VANILLA_BUILD/g' \
-            -e 's/\bOF_TARGET_DEVICES\b/FOX_TARGET_DEVICES/g' \
-            -e 's/\bFOX_USE_LZMA_COMPRESSION\b/OF_USE_LZMA_COMPRESSION/g' \
-            -e 's/\bFOX_ADVANCED_SECURITY\b/OF_ADVANCED_SECURITY/g' \
-            -e 's/\bFOX_USE_LZ4_COMPRESSION\b/OF_USE_LZ4_COMPRESSION/g' \
-            "$REPO_DIR/$DEVICE_PATH/"*.mk
-          if grep -HEq '\b(OF_VIRTUAL_AB_DEVICE|OF_AB_DEVICE|OF_PATCH_VBMETA_FLAG|OF_VANILLA_BUILD|OF_TARGET_DEVICES|FOX_USE_LZMA_COMPRESSION|FOX_ADVANCED_SECURITY|FOX_USE_LZ4_COMPRESSION)\b[[:space:]]*[:+?]?=' "$REPO_DIR/$DEVICE_PATH/"*.mk; then
-            echo "FAIL-FAST: obsolete OrangeFox variables remain after rewrite:"
-            grep -HnE '\b(OF_VIRTUAL_AB_DEVICE|OF_AB_DEVICE|OF_PATCH_VBMETA_FLAG|OF_VANILLA_BUILD|OF_TARGET_DEVICES|FOX_USE_LZMA_COMPRESSION|FOX_ADVANCED_SECURITY|FOX_USE_LZ4_COMPRESSION)\b[[:space:]]*[:+?]?=' "$REPO_DIR/$DEVICE_PATH/"*.mk
-            exit 1
-          fi
-          cat >> "$REPO_DIR/$DEVICE_PATH/BoardConfig.mk" <<EOF
+def decompress_any(blob: bytes):
+    pass
+    kind = sniff(blob)
+    if kind == "gzip":
+        try:
+            return gzip.decompress(blob), "gzip"
+        except Exception:
+            return None, "gzip-corrupt"
+    if kind == "xz":
+        try:
+            return lzma.decompress(blob), "xz"
+        except Exception:
+            return None, "xz-corrupt"
+    if kind == "lzma":
+        try:
+            return lzma.decompress(blob, format=lzma.FORMAT_ALONE), "lzma"
+        except Exception:
+            return None, "lzma-corrupt"
+    if kind == "zstd":
+        out = _run_cli(["zstd", "-d", "-q"], blob)
+        if out is None and shutil.which("unzstd"):
+            out = _run_cli(["unzstd", "-q"], blob)
+        return (out, "zstd") if out is not None else (None, "zstd-unopenable")
+    if kind == "lz4":
+        out = _run_cli(["lz4", "-d", "-q"], blob)
+        return (out, "lz4") if out is not None else (None, "lz4-unopenable")
+    if kind == "cpio-mentah":
+        return blob, "cpio-mentah"
+    return None, kind
 
-          FOX_AB_DEVICE := 1
-          OF_SCREEN_H := 2712
-          OF_STATUS_INDENT_LEFT := 48
-          OF_STATUS_INDENT_RIGHT := 48
-          OF_CLOCK_POS := 1
-          OF_ADVANCED_SECURITY := 1
-          OF_MAINTAINER := $MAINTAINER
-          EOF
-          echo "OrangeFox configuration appended:"
-          tail -18 "$REPO_DIR/$DEVICE_PATH/BoardConfig.mk"
-          if [ -f "$REPO_DIR/$DEVICE_PATH/twrp_malachite.mk" ]; then
-            PRODUCT_MK="$REPO_DIR/$DEVICE_PATH/twrp_malachite.mk"
-          else
-            PRODUCT_MK="$REPO_DIR/$DEVICE_PATH/device.mk"
-          fi
-          cat >> "$PRODUCT_MK" <<EOF
+def _comp_gzip(data: bytes) -> bytes:
+    return gzip.compress(data, compresslevel=9, mtime=0)
 
-          PRODUCT_APEX_SYSTEM_SERVER_JARS += com.android.crashrecovery:service-crashrecovery
-          EOF
-          echo "CrashRecovery PRODUCT_APEX_SYSTEM_SERVER_JARS fix appended to $PRODUCT_MK:"
-          tail -4 "$PRODUCT_MK"
-          if [ -f "$REPO_DIR/device/xiaomi/mondrian/vendorsetup.sh" ]; then
-            sed 's/FDEVICE="mondrian"/FDEVICE="malachite"/' \
-              "$REPO_DIR/device/xiaomi/mondrian/vendorsetup.sh" \
-              > "$REPO_DIR/$DEVICE_PATH/vendorsetup.sh"
-            echo "Created $DEVICE_PATH/vendorsetup.sh (official OrangeFox pattern):"
-            tail -20 "$REPO_DIR/$DEVICE_PATH/vendorsetup.sh"
-          else
-            echo "WARNING: official reference vendorsetup.sh not found in the sync;"
-            echo "         continuing without FOX_* environment setup."
-          fi
+def _comp_xz(data: bytes) -> bytes:
+    if shutil.which("xz"):
+        out = _run_cli(["xz", "-T0", "-9", "--check=crc32", "-q"], data)
+        if out is not None:
+            return out
+    return lzma.compress(data, format=lzma.FORMAT_XZ,
+                         preset=9, check=lzma.CHECK_CRC32)
 
-      - name: Pin sepolicy board-API flagging to 202504 (fox_16.0)
-        run: |
-          set -e
-          REPO_DIR="$GITHUB_WORKSPACE/workspace/fox_16.0"
-          MACROS="$REPO_DIR/system/sepolicy/flagging/flagging_macros"
-          if [ ! -f "$MACROS" ]; then
-            echo "FAIL-FAST: $MACROS not found (unexpected tree layout)"
-            exit 1
-          fi
-          if ! grep -q 'define(`starting_at_board_api' "$MACROS" || \
-             ! grep -q 'target_board_api_level' "$MACROS"; then
-            echo "FAIL-FAST: unexpected flagging_macros content:"
-            cat "$MACROS"
-            exit 1
-          fi
-          if grep -qF 'FOX-MALACHITE-CI: target_board_api_level pinned' "$MACROS"; then
-            echo "flagging_macros already pinned (idempotent rerun)"
-          else
-            cat >> "$MACROS" <<'EOF'
+def _comp_lzma(data: bytes) -> bytes:
+    return lzma.compress(data, format=lzma.FORMAT_ALONE, preset=9)
 
-          define(`target_board_api_level', `202504')
-          EOF
-          fi
-          echo "Pinned flagging_macros (tail):"
-          tail -n 13 "$MACROS"
-          TESTDIR="$(mktemp -d)"
-          cp "$MACROS" "$TESTDIR/flagging_macros"
-          cat > "$TESTDIR/use.te" <<'USEEOF'
-          starting_at_board_api(202504, `PIN_202504_EXPANDED_OK')
-          until_board_api(202504, `WRONG_UNTIL_202504_EXPANDED')
-          USEEOF
-          OUT="$(m4 -D target_board_api_level=34 "$TESTDIR/flagging_macros" "$TESTDIR/use.te")"
-          echo "m4 self-test output: $OUT"
-          if echo "$OUT" | grep -q PIN_202504_EXPANDED_OK && \
-             ! echo "$OUT" | grep -q WRONG_UNTIL_202504_EXPANDED; then
-            echo "m4 self-test PASSED: 202504 blocks expand, pre-202504 blocks suppressed"
-          else
-            echo "FAIL-FAST: flagging pin did not behave as expected. Output:"
-            echo "$OUT"
-            exit 1
-          fi
-          rm -rf "$TESTDIR"
+def _comp_zstd(data: bytes) -> bytes:
+    out = _run_cli(["zstd", "-19", "-T0", "-q"], data)
+    if out is None:
+        raise AsmError("zstd failed (CLI present but compression errored)")
+    return out
 
-      - name: Strip non-essential files from the device tree
-        run: |
-          set -e
-          cd "$GITHUB_WORKSPACE/workspace/fox_16.0/$DEVICE_PATH"
-          rm -rf .git .github README.md docs patches
-          echo "Device tree after cleanup:"
-          ls -la
+def codec_list() -> list:
+    pass
+    out = []
+    if shutil.which("zstd"):
+        out.append(("zstd", _comp_zstd))
+    out.append(("xz", _comp_xz))
+    out.append(("lzma", _comp_lzma))
+    out.append(("gzip", _comp_gzip))
+    return out
 
-      - name: Reclaim disk space (pre-build)
-        run: |
-          set -e
-          cd "$GITHUB_WORKSPACE/workspace/fox_16.0"
-          echo "Disk before build:"
-          df -h /
-          FREE_GB=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
-          if [ "$FREE_GB" -lt 30 ]; then
-            echo "Only ${FREE_GB} GB free — purging .repo git metadata (working trees kept)."
-            rm -rf .repo/projects .repo/project-objects
-            df -h /
-          fi
-          if [ "$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')" -lt 25 ]; then
-            echo "Purging unused prebuilts/abi-dumps (ABI checks are disabled)."
-            rm -rf prebuilts/abi-dumps
-            df -h /
-          fi
-          echo "Memory available for the build (swap was set up before the sync):"
-          free -h
-          swapon --show || true
+def parse_vb(data: bytes, label: str) -> dict:
+    if len(data) < 2200:
+        raise AsmError("%s: too small (%d B) for a vendor_boot" % (label, len(data)))
+    if data[:8] != MAGIC_VB:
+        raise AsmError("%s: magic %r is not VNDRBOOT (not an AOSP vendor_boot)" % (label, data[:8]))
+    h = {"label": label, "file_size": len(data)}
+    (h["ver"], h["page"], h["kaddr"], h["rdaddr"],
+     h["vr_size"]) = struct.unpack_from("<5I", data, OFF_VER)
+    if h["ver"] != 4:
+        raise AsmError("%s: header_version=%d — this assembler handles v4 only" % (label, h["ver"]))
+    h["hdr_size"] = struct.unpack_from("<I", data, OFF_HDRSIZE)[0]
+    h["dtb_size"] = struct.unpack_from("<I", data, OFF_DTBSIZE)[0]
+    h["dtb_addr"] = struct.unpack_from("<Q", data, OFF_DTBADDR)[0]
+    h["tbl_size"], h["ent_num"], h["ent_size"], h["bootcfg"] = \
+        struct.unpack_from("<IIII", data, OFF_TBLSIZE)
+    if h["hdr_size"] != HDR_V4_SIZE:
+        raise AsmError("%s: header_size=%d (expected %d) — unknown layout"
+                       % (label, h["hdr_size"], HDR_V4_SIZE))
+    if h["ent_size"] < MIN_ENT_SIZE:
+        raise AsmError("%s: entry_size=%d too small (<%d)" % (label, h["ent_size"], MIN_ENT_SIZE))
+    h["cmdline"] = data[28:28 + 2048].split(b"\x00")[0].decode("utf-8", "replace")
+    h["board"] = data[OFF_NAME:OFF_NAME + 16].split(b"\x00")[0].decode("utf-8", "replace")
 
-      - name: Build vendor_boot image
-        run: |
-          cd "$GITHUB_WORKSPACE/workspace/fox_16.0"
-          echo "Build step started: $(date -u)"
-          trap 'echo "=== Step received termination signal at $(date -u) ==="; df -h /; free -h; ps -eo pid,pcpu,pmem,rss,comm --sort=-rss | head -n 15' TERM INT
-          echo "=== Resources before build ==="
-          nproc
-          free -h
-          df -h /
-          export GOMEMLIMIT=14GiB
-          export SKIP_ABI_CHECKS=true
-          PRODUCT=$(grep -m1 -oE '(twrp|fox|omni)_[A-Za-z0-9_]+' "$DEVICE_PATH/AndroidProducts.mk" | head -n1)
-          if [ -z "$PRODUCT" ]; then
-            echo "ERROR: could not detect the product name in $DEVICE_PATH/AndroidProducts.mk"
-            exit 1
-          fi
-          echo "Building product: $PRODUCT"
+    page = h["page"]
+    blob_base = page
+    dtb_abs = align(blob_base + h["vr_size"], page)
+    tbl_abs_std = align(dtb_abs + h["dtb_size"], page)   
+    tbl_abs_alt = align(blob_base + h["vr_size"], page)  
 
-          set +e
-          source build/envsetup.sh
-          echo "envsetup sourced (exit code: $?)"
+    def read_table(off):
+        ents = []
+        if off < page or off + h["tbl_size"] > len(data):
+            return None
+        if h["ent_num"] == 0 or h["ent_num"] > 4096:
+            return None
+        for i in range(h["ent_num"]):
+            a = off + i * h["ent_size"]
+            raw = bytearray(data[a:a + h["ent_size"]])
+            if len(raw) != h["ent_size"]:
+                return None
+            size, eoff, etype = struct.unpack_from("<III", raw, E_SIZE)
+            nm = bytes(raw[E_NAME:E_NAME + 32]).split(b"\x00")[0].decode("utf-8", "replace")
+            ents.append({"idx": i, "size": size, "off": eoff,
+                         "type": etype, "name": nm, "raw": raw})
+        return ents
 
-          echo "Release configs available in the synced tree:"
-          ls build/release/release_configs/ 2>/dev/null | sed 's/^/  /' || echo "  (not found, relying on candidate list)"
+    def plausible(ents):
+        if not ents:
+            return False
+        for e in ents:
+            if e["type"] > 3 or e["size"] <= 0:
+                return False
+            if e["off"] < 0 or e["off"] + e["size"] > h["vr_size"]:
+                return False
+            if e["name"] and not e["name"].isprintable():
+                return False
+        return True
 
-          CANDIDATES="ap2a trunk_staging bp2a bp1a ap4a ap3a"
-          if command -v list_releases >/dev/null 2>&1; then
-            DISCOVERED=$(list_releases "$PRODUCT" 2>/dev/null | tr '\n' ' ')
-            if [ -n "$DISCOVERED" ]; then
-              echo "list_releases $PRODUCT -> $DISCOVERED"
-              CANDIDATES="$DISCOVERED $CANDIDATES"
-            fi
-          fi
+    ents, mode = read_table(tbl_abs_std), "standar"
+    if not plausible(ents) and tbl_abs_alt != tbl_abs_std:
+        e2 = read_table(tbl_abs_alt)
+        if plausible(e2):
+            ents, mode = e2, "alternatif"
+    if not plausible(ents):
+        raise AsmError("%s: invalid vendor_ramdisk table (tbl=%d, num=%d, esize=%d)"
+                       % (label, h["tbl_size"], h["ent_num"], h["ent_size"]))
+    if h["tbl_size"] != h["ent_num"] * h["ent_size"]:
+        _warn("%s: tbl_size=%d != ent_num*ent_size=%d (continuing with the table values)"
+              % (label, h["tbl_size"], h["ent_num"] * h["ent_size"]))
 
-          LUNCHED=0
-          for REL in $CANDIDATES; do
-            echo "Trying: lunch $PRODUCT-$REL-eng"
-            lunch "$PRODUCT-$REL-eng" > "/tmp/lunch_$REL.log" 2>&1
-            RC=$?
-            if [ "$RC" -eq 0 ]; then
-              echo "Lunch OK: $PRODUCT-$REL-eng"
-              echo "TARGET_PRODUCT=$TARGET_PRODUCT TARGET_RELEASE=$TARGET_RELEASE TARGET_BUILD_VARIANT=$TARGET_BUILD_VARIANT"
-              LUNCHED=1
-              break
-            else
-              echo "  failed (exit code $RC). Log tail:"
-              tail -n 15 "/tmp/lunch_$REL.log" | sed 's/^/    /'
-            fi
-          done
+    for e in ents:
+        b = data[blob_base + e["off"]: blob_base + e["off"] + e["size"]]
+        if len(b) != e["size"]:
+            raise AsmError("%s: entry[%d] blob '%s' out of file bounds" % (label, e["idx"], e["name"]))
+        e["blob"] = b
+        e["kompresi"] = sniff(b)
+    h["entrieses"] = ents
+    h["tbl_abs"] = tbl_abs_std if mode == "standar" else tbl_abs_alt
+    h["tbl_mode"] = mode
+    h["dtb"] = data[dtb_abs:dtb_abs + h["dtb_size"]] if h["dtb_size"] else b""
+    bcfg_abs = align(h["tbl_abs"] + h["tbl_size"], page)
+    h["bootcfg_bytes"] = data[bcfg_abs:bcfg_abs + h["bootcfg"]] if h["bootcfg"] else b""
+    h["header_page"] = bytes(data[:page])
+    h["avb"] = _avb_footer(data)
+    return h
 
-          if [ "$LUNCHED" -ne 1 ]; then
-            echo "ERROR: no release config worked for $PRODUCT. Tried: $CANDIDATES"
-            exit 1
-          fi
+def _avb_footer(data: bytes):
+    foot = data[-64:]
+    if foot[:4] != b"AVBf":
+        return None
+    vmaj, vmin = struct.unpack_from(">II", foot, 4)
+    orig, voff, vsz = struct.unpack_from(">QQQ", foot, 12)
+    return {"vmaj": vmaj, "vmin": vmin, "orig_size": orig,
+            "vbmeta_off": voff, "vbmeta_size": vsz}
 
-          mka "$BUILD_TARGET" 2>&1 | tee /tmp/mka.log
-          BUILD_RC=${PIPESTATUS[0]}
+def compute_layout(page, kept_end, fox_size, dtb_size, tbl_size, bootcfg_size):
+    pass
+    fox_off = kept_end
+    vr = fox_off + fox_size
+    dtb_abs = align(page + vr, page)
+    tbl_abs = align(dtb_abs + dtb_size, page)
+    bcfg_abs = align(tbl_abs + tbl_size, page)
+    return align(bcfg_abs + bootcfg_size, page), fox_off, vr
 
-          OOM_DETECTED=0
-          if sudo dmesg -T 2>/dev/null | grep -qiE 'killed process.*\((soong_build|soong_ui|ckati|ninja)\)'; then
-            OOM_DETECTED=1
-          fi
-          if [ "$BUILD_RC" -eq 137 ] || [ "$BUILD_RC" -eq 143 ]; then
-            if [ "$OOM_DETECTED" -eq 1 ]; then
-              echo "mka was killed (exit code $BUILD_RC) AND the kernel log shows an OOM kill."
-              echo "NOT retrying: within the same run the memory wall is identical."
-            else
-              echo "mka was terminated (exit code $BUILD_RC, no OOM evidence). Resource snapshot:"
-              free -h
-              df -h /
-              swapon --show || true
-              echo "Retrying once (incremental resume)..."
-              mka "$BUILD_TARGET" 2>&1 | tee /tmp/mka_retry.log
-              BUILD_RC=${PIPESTATUS[0]}
-            fi
-          fi
+def cpio_strip_init(raw):
+    if raw[:6] not in (b"070701", b"070702"):
+        return raw, []
+    out = bytearray()
+    removed = []
+    off, n = 0, len(raw)
+    while off + 110 <= n and raw[off:off + 6] in (b"070701", b"070702"):
+        f = [int(raw[off + 6 + i * 8: off + 14 + i * 8], 16) for i in range(13)]
+        namesize, fsize = f[11], f[6]
+        name = raw[off + 110: off + 110 + namesize - 1]
+        doff = (off + 110 + namesize + 3) & ~3
+        end = (doff + fsize + 3) & ~3
+        if name.rstrip(b"\x00") == b"TRAILER!!!":
+            off = end
+            continue
+        nm = name.decode("utf-8", "replace")
+        drop = ("/" not in nm) and nm.startswith("init") and not nm.startswith("init.recovery")
+        if not drop:
+            out += raw[off:end]
+        else:
+            removed.append(nm)
+        off = end
+    if not removed:
+        return raw, []
+    fields = [0] * 13
+    fields[11] = 11
+    out += b"070701" + b"".join(b"%08X" % x for x in fields) + b"TRAILER!!!\x00"
+    while len(out) % 4:
+        out += b"\x00"
+    return bytes(out), removed
 
-          if [ "$BUILD_RC" -ne 0 ]; then
-            echo "ERROR: mka $BUILD_TARGET failed (exit code $BUILD_RC). Last 120 lines:"
-            tail -n 120 /tmp/mka.log
-            if [ -f /tmp/mka_retry.log ]; then
-              echo "=== retry log tail ==="
-              tail -n 120 /tmp/mka_retry.log
-            fi
-            echo "=== memory ==="
-            free -h || true
-            swapon --show || true
-            echo "=== disk ==="
-            df -h / || true
-            echo "=== OOM killer evidence (if any) ==="
-            sudo dmesg -T 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' | tail -n 20 || echo "(no OOM records)"
-            if [ "$OOM_DETECTED" -eq 1 ]; then
-              echo ">>> CONFIRMED root cause: the kernel OOM-killed the build (see evidence above)."
-              echo ">>> The runner's total memory (RAM + swap) is smaller than soong's measured demand."
-            fi
-            exit 1
-          fi
-          echo "Build finished OK: $(date -u)"
+def run_avbtool(avbtool, out_path, partition, flags):
+    base = [sys.executable, avbtool, "add_hash_footer",
+            "--image", out_path, "--partition_name", "vendor_boot",
+            "--partition_size", str(partition), "--algorithm", "NONE"]
+    attempts = [base + ["--flags", str(flags)], base]
+    last = ""
+    for cmd in attempts:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        except (OSError, subprocess.TimeoutExpired) as ex:
+            last = str(ex)
+            continue
+        if r.returncode == 0:
+            return
+        last = (r.stderr or r.stdout or "").strip()
+    raise AsmError("avbtool add_hash_footer failed: %s" % last[:500])
 
-      - name: Collect plainbuild artifact
-        run: |
-          set -e
-          cd "$GITHUB_WORKSPACE/workspace/fox_16.0"
-          OUT="out/target/product/$DEVICE_CODENAME"
-          IMG="$OUT/vendor_boot.img"
-          if [ ! -f "$IMG" ]; then
-            echo "ERROR: vendor_boot.img (plainbuild) was not produced. Contents of $OUT:"
-            ls -la "$OUT" 2>/dev/null || true
-            find out/target/product -maxdepth 2 -name '*.img' || true
-            exit 1
-          fi
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          cp "$IMG" "$GITHUB_WORKSPACE/artifacts/OrangeFox-${ARTIFACT_LABEL}-${DEVICE_CODENAME}-plainbuild.img"
-          echo "Plainbuild saved (diagnosis only — NOT flashable as recovery)."
+def verify_footer(data, content_size, partition, flags):
+    if len(data) != partition:
+        raise AsmError("final image %d B != partition size %d B" % (len(data), partition))
+    foot = data[-64:]
+    if foot[:4] != MAGIC_AVBF:
+        raise AsmError("AVB footer missing after avbtool run (tail is not AVBf)")
+    orig, voff, vsz = struct.unpack_from(">QQQ", foot, 12)
+    if orig != content_size:
+        raise AsmError("footer orig_size=%d != content size=%d" % (orig, content_size))
+    if voff + vsz > len(data) or data[voff:voff + 4] != MAGIC_AVB0:
+        raise AsmError("vbmeta blob invalid at offset %d" % voff)
+    fflags = struct.unpack_from(">I", data, voff + 72)[0]
+    if flags and fflags != flags:
+        _warn("vbmeta flags=%d (requested %d) — this avbtool build ignored --flags" % (fflags, flags))
+    return {"orig_size": orig, "vbmeta_off": voff, "vbmeta_size": vsz, "flags": fflags}
 
-      - name: Harvest OrangeFox ramdisk from the plainbuild
-        run: |
-          set -e
-          cd "$GITHUB_WORKSPACE"
-          sudo apt-get install -y -qq lz4 zstd xz-utils >/dev/null 2>&1 || true
-          python3 harvest_fox_ramdisk.py \
-            "workspace/fox_16.0/out/target/product/$DEVICE_CODENAME/vendor_boot.img" \
-            fox_ramdisk.cpio
+def patch_entry(raw: bytearray, size: int, off: int, etype=None, name=None, zero_board=False):
+    struct.pack_into("<III", raw, E_SIZE, size, off, etype if etype is not None
+                     else struct.unpack_from("<I", raw, E_TYPE)[0])
+    if etype is not None:
+        struct.pack_into("<I", raw, E_TYPE, etype)
+    if name is not None:
+        nb = name.encode()[:31]
+        raw[E_NAME:E_NAME + 32] = nb + b"\x00" * (32 - len(nb))
+    if zero_board:
+        raw[E_BOARD:] = b"\x00" * (len(raw) - E_BOARD)
+    return raw
 
-      - name: Assemble hybrid vendor_boot (stock base + Fox RECOVERY blob)
-        run: |
-          set -e
-          cd "$GITHUB_WORKSPACE"
-          mkdir -p hybrid
-          AVBTOOL="workspace/fox_16.0/build/make/tools/releasetools/avbtool.py"
-          if [ ! -f "$AVBTOOL" ]; then
-            AVBTOOL=$(find workspace/fox_16.0/build -name avbtool.py -print -quit 2>/dev/null || true)
-          fi
-          if [ ! -f "$AVBTOOL" ]; then
-            echo "ERROR: avbtool.py not found in the synced tree - cannot produce a valid AVB footer"
-            exit 1
-          fi
-          echo "avbtool: $AVBTOOL"
-          python3 hybrid_assembler.py \
-            --stock stock/vendor_boot_stok.img \
-            --fragment fox_ramdisk.cpio \
-            --output hybrid/vendor_boot_hybrid.img \
-            --partition-size 67108864 \
-            --avbtool "$AVBTOOL" \
-            --avb-flags 3 \
-            --report assemble_report.json
-          python3 hybrid_assembler.py \
-            --stock stock/vendor_boot_stok.img \
-            --fragment fox_ramdisk.cpio \
-            --output hybrid/vendor_boot_noinit.img \
-            --partition-size 67108864 \
-            --avbtool "$AVBTOOL" \
-            --avb-flags 3 \
-            --strip-init \
-            --report assemble_report_noinit.json
-          python3 "$AVBTOOL" make_vbmeta_image --flags 3 --padding_size 4096 --output hybrid/vbmeta_disabled.img
-          sha256sum hybrid/vendor_boot_hybrid.img hybrid/vendor_boot_noinit.img hybrid/vbmeta_disabled.img
+def recompress_kept(kept, codec_name, comp_fn):
+    pass
+    new, cat, off = [], [], 0
+    for e in kept:
+        raw_content, how = decompress_any(e["blob"])
+        entry = dict(e)
+        if raw_content is None:
+            cat.append("entry[%d] '%s' unopenable (%s) — kept as-is"
+                       % (e["idx"], e["name"] or "?", how))
+            nb = e["blob"]
+        else:
+            if raw_content[:6] not in (b"070701", b"070702"):
+                i = raw_content.find(b"070701")
+                if i > 0:
+                    raw_content = raw_content[i:]
+            nb = comp_fn(raw_content)
+        raw = bytearray(e["raw"])
+        patch_entry(raw, len(nb), off)
+        entry["blob"], entry["raw"], entry["off"], entry["size"] = nb, raw, off, len(nb)
+        entry["kompresi"] = sniff(nb)
+        off += len(nb)
+        new.append(entry)
+    return new, cat
 
-      - name: Gate - fox_check must report zero FAIL (both variants)
-        run: |
-          set -e
-          cd "$GITHUB_WORKSPACE"
-          python3 fox_check_malachite.py hybrid/vendor_boot_hybrid.img stock/vendor_boot_stok.img
-          python3 fox_check_malachite.py hybrid/vendor_boot_noinit.img stock/vendor_boot_stok.img
+def verify(out: bytes, stock_img: dict, kept_orig: list, schema_mode: str,
+               fox_raw_ent: bytes, fox_blob: bytes, cpio_orig: bytes):
+    pass
+    v = parse_vb(out, "output")
+    note = []
 
-      - name: Collect final artifacts
-        run: |
-          set -e
-          cd "$GITHUB_WORKSPACE"
-          cp hybrid/vendor_boot_hybrid.img "artifacts/OrangeFox-${ARTIFACT_LABEL}-${DEVICE_CODENAME}-vendor_boot.img"
-          cp hybrid/vendor_boot_noinit.img "artifacts/OrangeFox-${ARTIFACT_LABEL}-${DEVICE_CODENAME}-vendor_boot_noinit.img"
-          cp hybrid/vbmeta_disabled.img artifacts/
-          cp assemble_report.json assemble_report_noinit.json artifacts/ 2>/dev/null || true
-          cd artifacts
-          for F in *.img; do zip -9 "${F%.img}.zip" "$F"; done
-          sha256sum * > sha256sums.txt
-          ls -la
-          {
-            echo "### OrangeFox ${ARTIFACT_LABEL} — $DEVICE_CODENAME"
-            echo '```'
-            cat sha256sums.txt
-            echo '```'
-            echo
-            echo "TRY IN THIS ORDER:"
-            echo "1. Standard hybrid (flash this first):"
-            echo "   fastboot flash vendor_boot OrangeFox-${ARTIFACT_LABEL}-${DEVICE_CODENAME}-vendor_boot.img"
-            echo "   fastboot reboot recovery"
-            echo "2. If normal boot breaks with 1 (bootloader ignores the RECOVERY type bit):"
-            echo "   fastboot flash vendor_boot OrangeFox-${ARTIFACT_LABEL}-${DEVICE_CODENAME}-vendor_boot_noinit.img"
-            echo "3. Rescue (boot still fails after 1 or 2):"
-            echo "   fastboot flash vbmeta vbmeta_disabled.img"
-            echo "   then retry step 1; revert by reflashing the stock vbmeta.img"
-            echo "Rollback: fastboot flash vendor_boot vendor_boot_stok.img"
-            echo "*-plainbuild.img is for diagnosis only."
-          } >> "$GITHUB_STEP_SUMMARY"
+    def chk(cond, msg):
+        if not cond:
+            raise AsmError("verification FAILED: " + msg)
+        note.append("[OK] " + msg)
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: OrangeFox-R12.0_0-Beta-malachite
-          path: artifacts/*
-          retention-days: 30
-          if-no-files-found: error
+    chk(v["ver"] == stock_img["ver"] and v["page"] == stock_img["page"], "ver/page size identical to stock")
+    for f in ("kaddr", "rdaddr", "cmdline", "board", "hdr_size", "dtb_size", "dtb_addr",
+              "ent_size", "bootcfg"):
+        chk(v[f] == stock_img[f], "header.%s kept (%s)" % (f, fmt(v[f]) if isinstance(v[f], int) else v[f]))
+    chk(v["vr_size"] == max([e["off"] + e["size"] for e in v["entrieses"]] or [0]),
+        "vr_size %s = end of the last blob" % fmt(v["vr_size"]))
+    chk(v["ent_num"] == len(kept_orig) + 1, "ent_num=%d (stock kept + 1 Fox entry)" % v["ent_num"])
+    for i in range(len(v["entrieses"]) - 1):
+        a, b = v["entrieses"][i], v["entrieses"][i + 1]
+        chk(a["off"] + a["size"] == b["off"],
+            "entries CONTIGUOUS: entry[%d] ends at %d = entry[%d] offset (no gaps — stock convention, "
+            "stream-loading bootloaders depend on it)" % (i, a["off"] + a["size"], i + 1))
+
+    for i, orig in enumerate(kept_orig):
+        e = v["entrieses"][i]
+        chk(e["type"] == orig["type"] and e["name"] == orig["name"],
+            "entry[%d] '%s' %s kept (type+name)" % (i, orig["name"] or "?", TYPE_LABEL[orig["type"]]))
+        if schema_mode == "as-is":
+            chk(e["blob"] == orig["blob"], "entry[%d] blob byte-exact from stock (%s B)"
+                % (i, fmt(orig["size"])))
+        else:
+            a_raw, _ = decompress_any(orig["blob"])
+            b_raw, how = decompress_any(e["blob"])
+            chk(a_raw is not None and a_raw == b_raw,
+                "entry[%d] CONTENT identical to original stock (recompressed %s: %s -> %s B)"
+                % (i, how, fmt(orig["size"]), fmt(e["size"])))
+    fox = v["entrieses"][-1]
+    chk(bytes(fox["raw"]) == bytes(fox_raw_ent), "Fox entry reuses stock RECOVERY entry bytes (with new size/offset)")
+    chk(fox["type"] == TYPE_RECOVERY, "Fox entry is RECOVERY-typed (2) — loaded by the bootloader in recovery mode")
+    chk(fox["blob"] == fox_blob, "Fox entry = fresh OrangeFox blob (%s B)" % fmt(len(fox_blob)))
+    dec, how = decompress_any(fox["blob"])
+    chk(dec == cpio_orig, "Fox blob decompressed back (%s) = original cpio %s B" % (how, fmt(len(cpio_orig))))
+    chk(v["dtb"] == stock_img["dtb"], "DTB byte-exact from stock (%s B)" % fmt(stock_img["dtb_size"]))
+    chk(v["bootcfg_bytes"] == stock_img["bootcfg_bytes"], "bootconfig kept (%s B)" % fmt(stock_img["bootcfg"]))
+    chk(v["avb"] is None, "content built without AVB footer (--avbtool adds a fresh one on the final file)")
+    return v, note
+
+_WARNINGS = []
+
+def _warn(m):
+    _WARNINGS.append(m)
+    print("  [!] " + m)
+
+def load_fragment(path):
+    blob = open(path, "rb").read()
+    kind = sniff(blob)
+    raw, how = decompress_any(blob)
+    if raw is None:
+        raise AsmError("fragment %s unopenable (%s). For lz4/zstd in Termux: "
+                       "pkg install lz4 zstd xz-utils" % (path, kind))
+    if raw[:6] not in (b"070701", b"070702"):
+        i = raw.find(b"070701", 0, 4096)
+        if i < 0:
+            raise AsmError("fragment %s is not a cpio archive (detection: %s). Provide a raw cpio "
+                           "or .gz/.xz/.zst of the recovery ramdisk." % (path, how))
+        raw = raw[i:]
+    return raw, kind, how
+
+def dump_entry(h):
+    for e in h["entrieses"]:
+        print("    [%d] %-18s %-8s %12s B  off=%-9d  isi=%s" %
+              (e["idx"], e["name"] or "(no-name)", TYPE_LABEL.get(e["type"], "?"),
+               fmt(e["size"]), e["off"], e["kompresi"]))
+
+def main(argv=None):
+    global _WARNINGS
+    _WARNINGS = []
+    ap = argparse.ArgumentParser(description=SCRIPT, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--stock", required=True, help="STOCK vendor_boot (from OTA/fastboot ROM)")
+    ap.add_argument("--fragment", required=True, help="ramdisk recovery OrangeFox: cpio / .gz / .xz / .zst / .lz4")
+    ap.add_argument("--output", default="vendor_boot_hybrid.img", help="hybrid output file")
+    ap.add_argument("--partition-size", type=lambda x: int(x, 0), default=None,
+                    help="vendor_boot partition size (default: stock file size)")
+    ap.add_argument("--avb-headroom", type=lambda x: int(x, 0), default=0,
+                    help="reserve space for the avbtool AVB footer (e.g. 8192)")
+    ap.add_argument("--codec", choices=["auto", "zstd", "xz", "lzma", "gzip"], default="auto",
+                    help="force the Fox fragment codec (default: auto = first one that fits)")
+    ap.add_argument("--recompress-stock", choices=["auto", "never", "force"], default="auto",
+                    help="recompress kept stock blobs (default: auto)")
+    ap.add_argument("--keep-stock-recovery", action="store_true",
+                    help="do not replace the stock RECOVERY entry — Fox is added as a new entry")
+    ap.add_argument("--entry-name", default=None,
+                    help="Fox entry name (default: keep the stock name / 'recovery' when adding)")
+    ap.add_argument("--pad-to-partition", action="store_true",
+                    help="pad the output exactly to partition size (no AVB footer; ignored with --avbtool)")
+    ap.add_argument("--avbtool", default=None,
+                    help="path to avbtool.py - re-adds a fresh AVB footer on the output (recommended)")
+    ap.add_argument("--avb-flags", type=lambda x: int(x, 0), default=3,
+                    help="vbmeta flags for the new footer (default 3 = verity+verification disabled)")
+    ap.add_argument("--strip-init", action="store_true",
+                    help="remove root-level init/init.rc files from the Fox cpio (stock-style fragment, "
+                         "for bootloaders that load RECOVERY fragments in every boot mode)")
+    ap.add_argument("--report", default=None, help="write the JSON report")
+    ap.add_argument("--dry-run", action="store_true", help="compute the budget only, write no files")
+    args = ap.parse_args(argv)
+
+    print("== %s — vendor_boot hybrid malachite ==" % SCRIPT)
+    t0 = time.time()
+
+    stock_data = open(args.stock, "rb").read()
+    stock_img = parse_vb(stock_data, "stock")
+    partition = args.partition_size or stock_img["file_size"]
+    page = stock_img["page"]
+    print("[+] stock: %s B | header v4 | page %d | vr_size %s B | %d entrieses x %d B (%s)"
+          % (fmt(stock_img["file_size"]), page, fmt(stock_img["vr_size"]), stock_img["ent_num"],
+             stock_img["ent_size"], stock_img["tbl_mode"]))
+    if stock_img["ent_size"] != 108:
+        _warn("stock entry_size = %d (not 108) — patching stays safe for the first 44 bytes of fields" % stock_img["ent_size"])
+    if stock_img["avb"]:
+        print("[i] stock AVBf footer: orig_size=%s B (will be dropped from the output)"
+              % fmt(stock_img["avb"]["orig_size"]))
+    dump_entry(stock_img)
+
+    cpio_raw, kind_in, how_in = load_fragment(args.fragment)
+    n_cpio = cpio_raw.count(b"070701")
+    print("[+] OrangeFox recovery cpio: ~%d cpio headers, %s B (input %s -> opened as %s)"
+          % (n_cpio, fmt(len(cpio_raw)), kind_in, how_in))
+
+    removed_init = []
+    if args.strip_init:
+        cpio_raw, removed_init = cpio_strip_init(cpio_raw)
+        print("[+] strip-init: removed %d root-level init entry(ies)%s"
+              % (len(removed_init), ": " + ", ".join(removed_init) if removed_init else " (none found)"))
+        print("[i] noinit variant: the Fox fragment no longer carries its own /init — normal boot stays "
+              "safe even if the bootloader loads RECOVERY fragments in every mode; recovery boot relies "
+              "on the stock init flow exec-ing /system/bin/recovery from the fragment")
+
+    if args.keep_stock_recovery:
+        kept = [dict(e) for e in stock_img["entrieses"]]
+        rec_stock = next((e for e in stock_img["entrieses"] if e["type"] == TYPE_RECOVERY), None)
+        entry_mode = "tambah"
+    else:
+        kept = [dict(e) for e in stock_img["entrieses"] if e["type"] != TYPE_RECOVERY]
+        rec_stock = next((e for e in stock_img["entrieses"] if e["type"] == TYPE_RECOVERY), None)
+        entry_mode = "ganti"
+        missing = [e for e in stock_img["entrieses"] if e["type"] == TYPE_RECOVERY]
+        for e in missing:
+            print("[+] stock RECOVERY blob '%s' (%s B, %s) REPLACED with the OrangeFox blob — other entrieses intact"
+                  % (e["name"] or "?", fmt(e["size"]), e["kompresi"]))
+        if rec_stock is None:
+            _warn("stock has NO RECOVERY-type entry — OrangeFox is added as a new entry "
+                  "(this composition stays valid: the bootloader loads PLATFORM/DLKM in normal mode, "
+                  "+RECOVERY in recovery mode)")
+    if not kept:
+        _warn("no stock blobs kept — normal boot fully depends on the new entry content")
+
+    kept_end = max([e["off"] + e["size"] for e in kept], default=0)
+    tbl_size_new = (len(kept) + 1) * stock_img["ent_size"]
+
+    codecs = codec_list()
+    if args.codec != "auto":
+        codecs = [c for c in codecs if c[0] == args.codec]
+        if not codecs:
+            raise AsmError("codec %s unavailable in this environment (zstd CLI missing?)" % args.codec)
+    schema = []
+    if args.recompress_stock in ("auto", "never"):
+        schema += [("as-is", c) for c in codecs]
+    if args.recompress_stock in ("auto", "force"):
+        schema += [("stock-recomp", c) for c in codecs]
+    if args.recompress_stock == "force":
+        schema = [("stock-recomp", c) for c in codecs]
+
+    candidates, chosen = [], None
+    for mode_schema, (codec_name, comp_fn) in [(m, c) for m, c in schema]:
+        fox_blob = comp_fn(cpio_raw)
+        if mode_schema == "as-is":
+            kept_cur, stock_codec, kept_end_cur = kept, None, kept_end
+        else:
+            kept_cur, cat = recompress_kept(kept, codec_name, comp_fn)
+            stock_codec = codec_name
+            kept_end_cur = max([e["off"] + e["size"] for e in kept_cur], default=0)
+            for c in cat:
+                _warn(c)
+        total, fox_off, vr_new = compute_layout(page, kept_end_cur, len(fox_blob),
+                                               stock_img["dtb_size"], tbl_size_new, stock_img["bootcfg"])
+        load = total + args.avb_headroom <= partition
+        candidates.append({"mode": mode_schema, "codec": codec_name, "fox": len(fox_blob),
+                         "total": total, "muat": load})
+        print("  [>] candidate %-10s %-6s : fox=%s  total=%s  %s" %
+              ("[%s]" % mode_schema, codec_name, fmt(len(fox_blob)), fmt(total),
+               "MUAT" if load else "does not fit (partition %s%s)" %
+               (fmt(partition), " - headroom %s" % fmt(args.avb_headroom) if args.avb_headroom else "")))
+        if load and chosen is None:
+            chosen = {"mode": mode_schema, "codec": codec_name, "stock_codec": stock_codec,
+                       "kept": kept_cur, "kept_end": kept_end_cur, "fox_blob": fox_blob,
+                       "fox_off": fox_off, "vr": vr_new, "total": total}
+            break
+    if chosen is None:
+        best = min(candidates, key=lambda k: k["total"]) if candidates else None
+        msg = ["DOES NOT FIT: no codec combination fits partition %s B (AVB headroom %s B)."
+                 % (fmt(partition), fmt(args.avb_headroom))]
+        if best:
+            msg.append("Smallest combination: %s/%s -> total %s B (overrun %s B)." %
+                         (best["mode"], best["codec"], fmt(best["total"]), fmt(best["total"] + args.avb_headroom - partition)))
+        msg.append("Suggestions: (1) shrink the OrangeFox rootfs (extra themes/res), (2) check the zstd CLI "
+                     "is installed (best ratio + fast decompression), (3) use the correct partition.")
+        raise AsmError(" ".join(msg))
+
+    fox_blob = chosen["fox_blob"]
+    fox_off = chosen["fox_off"]
+    vr_new = chosen["vr"]
+    kept_cur = chosen["kept"]
+    tbl_size_new = (len(kept_cur) + 1) * stock_img["ent_size"]
+
+    if entry_mode == "ganti" and rec_stock is not None:
+        fox_raw_ent = bytearray(rec_stock["raw"])          
+        patch_entry(fox_raw_ent, len(fox_blob), fox_off)  
+    else:
+        source = next((e for e in kept_cur if e["type"] == TYPE_PLATFORM), kept_cur[0] if kept_cur else rec_stock)
+        fox_raw_ent = bytearray(source["raw"] if source is not None else
+                                bytearray(stock_img["ent_size"]))
+        if len(fox_raw_ent) < stock_img["ent_size"]:
+            fox_raw_ent += b"\x00" * (stock_img["ent_size"] - len(fox_raw_ent))
+        patch_entry(fox_raw_ent, len(fox_blob), fox_off, etype=TYPE_RECOVERY,
+                    name=args.entry_name or "recovery", zero_board=True)
+
+    hdr = bytearray(stock_img["header_page"])                  
+    struct.pack_into("<I", hdr, OFF_VRSIZE, vr_new)
+    struct.pack_into("<I", hdr, OFF_TBLSIZE, tbl_size_new)
+    struct.pack_into("<I", hdr, OFF_ENTNUM, len(kept_cur) + 1)
+    out = bytearray(hdr)
+    region = bytearray(vr_new)
+    for e in kept_cur:
+        region[e["off"]:e["off"] + e["size"]] = e["blob"]
+    region[fox_off:fox_off + len(fox_blob)] = fox_blob
+    out += region
+    out += b"\x00" * ((page - len(out) % page) % page)
+    out += stock_img["dtb"]
+    out += b"\x00" * ((page - len(out) % page) % page)
+    out += b"".join(bytes(e["raw"]) for e in kept_cur) + bytes(fox_raw_ent)
+    out += b"\x00" * ((page - len(out) % page) % page)
+    out += stock_img["bootcfg_bytes"]
+    out += b"\x00" * ((page - len(out) % page) % page)
+    dtb_abs = align(page + chosen["vr"], page)
+    tbl_abs = align(dtb_abs + stock_img["dtb_size"], page)
+    if args.pad_to_partition and not args.avbtool:
+        if len(out) > partition:
+            raise AsmError("pad-to-partition: content %s B > partition %s B" % (fmt(len(out)), fmt(partition)))
+        out += b"\x00" * (partition - len(out))
+
+    v, note = verify(bytes(out), stock_img, kept, chosen["mode"], fox_raw_ent,
+                        fox_blob, cpio_raw)
+
+    print("")
+    print("[=] Fox fragment codec : %s (stock mode: %s%s)" %
+          (chosen["codec"], chosen["mode"],
+           ", stock blobs recompressed with %s" % chosen["stock_codec"] if chosen["stock_codec"] else ""))
+    print("[i] layout: fox blob @%d (contiguous after stock blobs) | vr_size %s | dtb @%d | table @%d"
+          % (chosen["fox_off"], fmt(chosen["vr"]), dtb_abs, tbl_abs))
+    for k in note:
+        print("  " + k)
+    rest = partition - args.avb_headroom - chosen["total"]
+    print("[=] total %s B of %s B partition — %s B free (AVB headroom %s B)"
+          % (fmt(chosen["total"]), fmt(partition),
+             fmt(max(rest, 0)), fmt(args.avb_headroom)))
+    print("[i] normal boot: stock PLATFORM/DLKM blobs %s — untouched (byte-exact)" %
+          ("byte-exact" if chosen["mode"] == "as-is" else "recompressed, same content"))
+    print("[i] GKI kernel android15-6.6: RD_GZIP/RD_LZMA/RD_XZ/RD_LZ4/RD_ZSTD default y; "
+          "the RECOVERY fragment loads only in recovery mode (decompression failure does not affect normal boot).")
+    print("[i] if recovery fails to boot (rare): retry with --codec xz or --codec gzip "
+          "(+ --recompress-stock force if space is needed).")
+    print("[=] %s — %s B, sha256 %s" % (args.output, fmt(len(out)), sha256(bytes(out))[:32]))
+
+    avb_out = None
+    if not args.dry_run:
+        if args.avbtool:
+            if args.pad_to_partition:
+                _warn("--pad-to-partition ignored: --avbtool owns the final padding")
+            tmp = args.output + ".content"
+            with open(tmp, "wb") as f:
+                f.write(out)
+            try:
+                shutil.copyfile(tmp, args.output)
+                run_avbtool(args.avbtool, args.output, partition, args.avb_flags)
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            fin = bytearray(open(args.output, "rb").read())
+            foot = fin[-64:]
+            if foot[:4] == MAGIC_AVBF and args.avb_flags:
+                _, voff, _ = struct.unpack_from(">QQQ", foot, 12)
+                if fin[voff:voff + 4] == MAGIC_AVB0 and voff + 76 <= len(fin):
+                    cur = struct.unpack_from(">I", fin, voff + 72)[0]
+                    if cur != args.avb_flags:
+                        struct.pack_into(">I", fin, voff + 72, args.avb_flags)
+                        with open(args.output, "wb") as f:
+                            f.write(bytes(fin))
+                        _warn("this avbtool build lacks --flags support - vbmeta flags "
+                              "byte-patched to %d directly (safe: algorithm NONE is unsigned)"
+                              % args.avb_flags)
+            avb_out = verify_footer(open(args.output, "rb").read(), len(out), partition, args.avb_flags)
+            print("[=] fresh AVB footer: orig_size=%s, vbmeta@%s (flags=%d — verity+verification disabled "
+                  "at the vendor_boot level)" % (fmt(avb_out["orig_size"]), fmt(avb_out["vbmeta_off"]),
+                                                   avb_out["flags"]))
+        else:
+            with open(args.output, "wb") as f:
+                f.write(out)
+            if stock_img["avb"]:
+                _warn("output has NO AVB footer while the stock image HAS one — many MTK bootloaders "
+                      "refuse footerless images; rerun with --avbtool <path-to-avbtool.py> (build/make/"
+                      "tools/releasetools/avbtool.py inside the synced tree) so the output matches the "
+                      "stock convention")
+    if args.report:
+        rep = {
+            "tool": SCRIPT, "waktu": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "stock": {"file": args.stock, "size": stock_img["file_size"], "vr_size": stock_img["vr_size"],
+                     "entries": [{"name": e["name"], "type": e["type"], "size": e["size"],
+                                "off": e["off"], "kompresi": e["kompresi"]} for e in stock_img["entrieses"]],
+                     "avb": stock_img["avb"]},
+            "fragment": {"file": args.fragment, "input": kind_in, "cpio_bytes": len(cpio_raw),
+                        "strip_init": removed_init},
+            "layout": {"fox_off": chosen["fox_off"], "vr_size": chosen["vr"],
+                       "dtb_abs": dtb_abs, "tbl_abs": tbl_abs},
+            "dipilih": {"mode": chosen["mode"], "codec": chosen["codec"],
+                        "stock_codec": chosen["stock_codec"], "fox_blob": len(fox_blob),
+                        "total": chosen["total"], "sisa": rest},
+            "avb_output": avb_out,
+            "kandidat": candidates,
+            "output": {"file": None if args.dry_run else args.output,
+                       "size": len(out), "sha256": sha256(bytes(out))},
+            "peringatan": _WARNINGS,
+        }
+        with open(args.report, "w") as f:
+            json.dump(rep, f, indent=2, ensure_ascii=False)
+        print("[=] report: %s" % args.report)
+    print("[=] finished in %.1f s" % (time.time() - t0))
+    return 0
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except AsmError as ex:
+        print("[X] " + str(ex), file=sys.stderr)
+        sys.exit(1)
