@@ -1,0 +1,17 @@
+ro.adb.secure=0
+
+ro.boot.dynamic_partitions=true
+
+ro.sys.usb.storage.type=mtp
+
+ro.crypto.volume.filenames_mode=aes-256-cts
+
+ro.vendor.mediatek.platform=MT6878
+
+persist.sys.timezone=Asia/Shanghai
+
+external_storage.projid.enabled=1
+external_storage.casefold.enabled=1
+external_storage.sdcardfs.enabled=0
+
+ro.vendor.api_level=34
