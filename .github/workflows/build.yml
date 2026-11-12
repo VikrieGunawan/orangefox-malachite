@@ -137,10 +137,9 @@ jobs:
           cp -a "$GITHUB_WORKSPACE/device_tree" device/xiaomi/malachite
           test -f device/xiaomi/malachite/twrp_malachite.mk
           test -f device/xiaomi/malachite/prebuilt/dtb
+          rm -rf device/xiaomi/malachite/.git
           cd device/xiaomi/malachite
-          git init -q -b main
-          git add -A
-          git commit -qm "malachite OrangeFox device tree"
+          (git init -q -b main && git add -A && git commit -qm "malachite OrangeFox device tree") || echo "Device tree git init skipped, continuing without it"
 
       - name: Apply the recovery touch haptics patch
         run: |
