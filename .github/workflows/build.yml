@@ -67,12 +67,14 @@ jobs:
             echo "::error::Not enough disk space (${AVAIL} MB free). At least ${MIN_FREE_MB} MB is required."
             exit 1
           fi
-          sudo fallocate -l 8G /tmp/swapfile 2>/dev/null || true
+          sudo fallocate -l 16G /tmp/swapfile 2>/dev/null || true
           if [ -f /tmp/swapfile ]; then
             sudo chmod 600 /tmp/swapfile
             sudo mkswap /tmp/swapfile || true
-            sudo swapon /tmp/swapfile || true
+            sudo swapon /tmp/swapfile || echo "::warning::swapon failed, the build will rely on RAM only"
           fi
+          free -h
+          swapon --show || true
 
       - name: Install build dependencies
         run: |
@@ -92,7 +94,7 @@ jobs:
           sudo apt-get clean
 
       - name: Sync OrangeFox fox_16.0 source tree
-        timeout-minutes: 170
+        timeout-minutes: 160
         run: |
           mkdir -p $HOME/fox && cd $HOME/fox
           OK=0
@@ -162,7 +164,7 @@ jobs:
           df -h "$HOME/fox" "$OUT_DIR" || df -h "$HOME/fox"
 
       - name: Build OrangeFox vendor_boot image
-        timeout-minutes: 170
+        timeout-minutes: 180
         env:
           PERM: ${{ inputs.selinux_permissive }}
         run: |
@@ -174,6 +176,8 @@ jobs:
           export FOX_VIRTUAL_AB_DEVICE=1
           if [ "$PERM" = "true" ]; then export MALACHITE_RECOVERY_PERMISSIVE=true; fi
           df -h "$HOME/fox" "$OUT_DIR" || df -h "$HOME/fox"
+          free -h
+          swapon --show || true
           BUILD_START=$(date -u +%s)
           (
             while true; do
@@ -181,7 +185,9 @@ jobs:
               A=$(df -BM --output=avail "$HOME/fox" 2>/dev/null | tail -1 | tr -dc '0-9')
               B=$(df -BM --output=avail "$OUT_DIR" 2>/dev/null | tail -1 | tr -dc '0-9')
               R=$(free -m | awk '/^Mem:/ {print $7}')
-              echo "[watch] $(date -u +%H:%M:%S) source ${A:-unknown} MB free, output ${B:-unknown} MB free, ram available ${R:-unknown} MB"
+              S=$(free -m | awk '/^Swap:/ {print $3}')
+              T=$(ps -eo rss=,comm= --sort=-rss 2>/dev/null | head -3 | awk '{printf "%s=%dMB ", $2, $1/1024}')
+              echo "[watch] $(date -u +%H:%M:%S) source ${A:-unknown} MB free, output ${B:-unknown} MB free, ram available ${R:-unknown} MB, swap used ${S:-unknown} MB, top ${T:-none}"
             done
           ) &
           LOGGER=$!
