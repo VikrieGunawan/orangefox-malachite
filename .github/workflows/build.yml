@@ -1,0 +1,198 @@
+name: Build OrangeFox Recovery
+
+env:
+  FOX_MANIFEST_URL: https://gitlab.com/OrangeFox/fox/manifest.git
+  FOX_MANIFEST_URL_ALT: https://gitlab.com/OrangeFox/Manifest.git
+  FOX_BRANCH: fox_14.1
+  SYNC_JOBS: 4
+  BUILD_JOBS: 2
+  MIN_FREE_MB: 25000
+  BUILD_DISK_CRIT_MB: 4000
+
+on:
+  workflow_dispatch:
+    inputs:
+      selinux_permissive:
+        description: Add androidboot.selinux=permissive to the vendor cmdline only if the recovery fails to boot with SELinux enforcing
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build OrangeFox for malachite
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      - name: Checkout build package
+        uses: actions/checkout@v4
+        with:
+          path: device_tree
+
+      - name: Prepare workspace and check disk space
+        run: |
+          echo "CPU: $(nproc --all) | RAM: $(free -g | awk '/Mem:/ {print $2}') GB"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache \
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup /opt/microsoft /opt/google \
+            /usr/local/share/powershell /usr/lib/google-cloud-sdk /usr/lib/jvm /usr/share/miniconda \
+            /usr/local/julia* /usr/lib/firefox /opt/az || true
+          sudo docker image prune --all --force || true
+          sudo apt-get clean
+          df -h / /mnt
+          ROOT_MB=$(df -BM --output=avail / | tail -1 | tr -dc '0-9')
+          MNT_MB=$(df -BM --output=avail /mnt 2>/dev/null | tail -1 | tr -dc '0-9')
+          MNT_MB=${MNT_MB:-0}
+          if [ "$MNT_MB" -gt "$ROOT_MB" ] && [ "$MNT_MB" -gt 15000 ]; then
+            sudo mkdir -p /mnt/fox && sudo chown -R "$(id -u):$(id -g)" /mnt/fox
+            ln -sfn /mnt/fox /home/runner/fox
+            AVAIL=$MNT_MB
+          else
+            mkdir -p /home/runner/fox
+            AVAIL=$ROOT_MB
+          fi
+          echo "Build directory has ${AVAIL} MB free"
+          if [ "$AVAIL" -lt "$MIN_FREE_MB" ]; then
+            echo "::error::Not enough disk space (${AVAIL} MB free). At least ${MIN_FREE_MB} MB is required."
+            exit 1
+          fi
+          sudo fallocate -l 8G /tmp/swapfile 2>/dev/null || true
+          if [ -f /tmp/swapfile ]; then
+            sudo chmod 600 /tmp/swapfile
+            sudo mkswap /tmp/swapfile || true
+            sudo swapon /tmp/swapfile || true
+          fi
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends git-core git-lfs gnupg flex bison \
+            build-essential zip curl zlib1g-dev libc6-dev-i386 libncurses5 x11proto-core-dev \
+            libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
+            python3 python3-pip lz4 bc ccache rsync libssl-dev openjdk-17-jdk
+          mkdir -p $HOME/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > $HOME/bin/repo
+          chmod a+x $HOME/bin/repo
+          echo "$HOME/bin" >> $GITHUB_PATH
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@users.noreply.github.com"
+          git config --global color.ui false
+          git lfs install
+          sudo apt-get clean
+
+      - name: Sync OrangeFox fox_14.1 source tree
+        run: |
+          mkdir -p $HOME/fox && cd $HOME/fox
+          repo init --depth=1 -u "$FOX_MANIFEST_URL" -b "$FOX_BRANCH" \
+            || repo init --depth=1 -u "$FOX_MANIFEST_URL_ALT" -b "$FOX_BRANCH"
+          (
+            while true; do
+              A=$(df -BM --output=avail "$HOME/fox" | tail -1 | tr -dc '0-9')
+              if [ "${A:-0}" -lt 2000 ]; then
+                echo "::error::Disk space critical (${A} MB left), sync stopped"
+                pkill -f "repo" || true
+                break
+              fi
+              sleep 5
+            done
+          ) &
+          GUARD=$!
+          set +e
+          repo sync -c -j"$SYNC_JOBS" --force-sync --no-clone-bundle --no-tags
+          RC=$?
+          kill "$GUARD" 2>/dev/null || true
+          echo "Sync finished with code $RC"
+          df -h "$HOME/fox"
+          exit $RC
+
+      - name: Place the malachite device tree
+        run: |
+          set -e
+          cd $HOME/fox
+          mkdir -p device/xiaomi
+          rm -rf device/xiaomi/malachite
+          cp -a "$GITHUB_WORKSPACE/device_tree" device/xiaomi/malachite
+          test -f device/xiaomi/malachite/twrp_malachite.mk
+          test -f device/xiaomi/malachite/prebuilt/dtb
+
+      - name: Apply the recovery touch haptics patch
+        run: |
+          cd $HOME/fox
+          P=device/xiaomi/malachite/patches/0001-minuitwrp-skip-unavailable-aidl-haptics.patch
+          if git -C bootable/recovery apply --check "$P"; then
+            git -C bootable/recovery apply "$P"
+            echo "Haptics patch applied"
+          elif git -C bootable/recovery apply --check --3way "$P"; then
+            git -C bootable/recovery apply --3way "$P"
+            echo "Haptics patch applied with a 3way merge"
+          else
+            echo "::warning::Haptics patch does not apply to this bootable/recovery revision, continuing without it"
+          fi
+
+      - name: Build OrangeFox vendor_boot image
+        env:
+          PERM: ${{ inputs.selinux_permissive }}
+        run: |
+          cd $HOME/fox
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export LC_ALL=C
+          export FOX_BUILD_DEVICE=malachite
+          export OF_DEFAULT_KEYMASTER_VERSION=4.1
+          export FOX_VIRTUAL_AB_DEVICE=1
+          if [ "$PERM" = "true" ]; then export MALACHITE_RECOVERY_PERMISSIVE=true; fi
+          (
+            while true; do
+              A=$(df -BM --output=avail "$HOME/fox" | tail -1 | tr -dc '0-9')
+              if [ "${A:-0}" -lt "$BUILD_DISK_CRIT_MB" ]; then
+                echo "::error::Disk space critical (${A} MB left), build stopped"
+                pkill -f "soong" || true
+                pkill -f "java" || true
+                exit 1
+              fi
+              sleep 15
+            done
+          ) &
+          GUARD=$!
+          set +e
+          source build/envsetup.sh
+          lunch twrp_malachite-ap2a-eng || lunch twrp_malachite-eng
+          mka vendorbootimage -j"$BUILD_JOBS" 2>&1 | tee $HOME/build.log
+          RC=${PIPESTATUS[0]}
+          kill "$GUARD" 2>/dev/null || true
+          echo "Build finished with code $RC"
+          df -h "$HOME/fox"
+          exit $RC
+
+      - name: Collect build outputs
+        run: |
+          OUT=$HOME/fox/out/target/product/malachite
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          if [ ! -f "$OUT/vendor_boot.img" ]; then
+            echo "::error::vendor_boot.img was not produced"
+            tail -50 $HOME/build.log || true
+            exit 1
+          fi
+          cp "$OUT/vendor_boot.img" "$GITHUB_WORKSPACE/output/vendor_boot.img"
+          find "$OUT" -maxdepth 1 -name "OrangeFox*.zip" -exec cp {} "$GITHUB_WORKSPACE/output/" \; || true
+          find "$OUT" -maxdepth 1 -name "OrangeFox*.img" -exec cp {} "$GITHUB_WORKSPACE/output/" \; || true
+          cd "$GITHUB_WORKSPACE/output"
+          sha256sum $(ls | grep -v SHA256SUMS.txt) > SHA256SUMS.txt
+          ls -lh
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrangeFox-malachite
+          path: output/*
+          if-no-files-found: error
+
+      - name: Upload GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: OrangeFox-malachite-v${{ github.run_number }}
+          name: OrangeFox Recovery malachite build ${{ github.run_number }}
+          body: Unofficial OrangeFox Recovery build for Redmi Note 14 Pro 5G (malachite). Flash the image to the vendor_boot partition.
+          files: output/*
+          fail_on_unmatched_files: true
