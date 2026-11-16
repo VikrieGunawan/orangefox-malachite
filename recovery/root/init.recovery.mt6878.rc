@@ -1,8 +1,6 @@
 on fs
     start boot-hal-1-2
     symlink /dev/block /dev/block/bootdevice
-    symlink /dev/block/sda /dev/block/mmcblk0boot0
-    symlink /dev/block/sdb /dev/block/mmcblk0boot1
     install_keyring
     mkdir /mnt/vendor/persist 0755 system system
     mkdir /persist 0755 system system

@@ -21,17 +21,29 @@ void property_override(string prop, string value)
 
 void vendor_load_properties()
 {
+    // ro.boot.hwc comes from the bootloader: CN is the China Redmi, everything else is POCO X7
+    string hwc = GetProperty("ro.boot.hwc", "");
+    string brand = "POCO", model = "24095PCADG", marketname = "POCO X7";
+    if (hwc == "CN") {
+        brand = "Redmi";
+        model = "24090RA29C";
+        marketname = "Redmi Note 14 Pro 5G";
+    } else if (hwc == "INDIA" || hwc == "IN") {
+        model = "24095PCADI";
+    }
+
     string prop_partitions[] = {"", "vendor.", "odm."};
     for (const string &prop : prop_partitions)
     {
-        property_override(string("ro.product.") + prop + string("brand"), "Redmi");
+        property_override(string("ro.product.") + prop + string("brand"), brand);
         property_override(string("ro.product.") + prop + string("manufacturer"), "Xiaomi");
         property_override(string("ro.product.") + prop + string("name"), "malachite");
         property_override(string("ro.product.") + prop + string("device"), "malachite");
-        property_override(string("ro.product.") + prop + string("model"), "24090RA29C");
-        property_override(string("ro.product.") + prop + string("marketname"), "Redmi Note 14 Pro");
-        property_override(string("ro.product.") + prop + string("cert"), "24090RA29C");
+        property_override(string("ro.product.") + prop + string("model"), model);
+        property_override(string("ro.product.") + prop + string("marketname"), marketname);
+        property_override(string("ro.product.") + prop + string("cert"), model);
     }
-    property_override("ro.bootimage.build.date.utc", "1756453697");
-    property_override("ro.build.date.utc", "1756453697");
+    // 2024-01-01, older than any malachite firmware, so sideload never rejects a payload as a downgrade
+    property_override("ro.bootimage.build.date.utc", "1704067200");
+    property_override("ro.build.date.utc", "1704067200");
 }

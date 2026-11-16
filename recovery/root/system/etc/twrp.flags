@@ -6,9 +6,7 @@
 /mi_ext                    ext4                /dev/block/mapper/mi_ext                               flags=display="MI EXT";logical
 /mi_ext                    erofs                /dev/block/mapper/mi_ext                               flags=display="MI EXT";logical
 
-/cust_image                       emmc                      /dev/block/by-name/cust                             flags=display="Customization Preload [ cust ]";backup=1
 
-/super                                emmc                     /dev/block/by-name/super                           flags=display="Super Image [ super ]";backup=1
 
 /boot                                 emmc                      /dev/block/by-name/boot                              flags=display="Kernel Boot Image [ boot ] ";slotselect;backup=1;flashimg=1
 /init_boot                     emmc                      /dev/block/by-name/init_boot                  flags=display="Init Boot Image [ init_boot ]";slotselect;backup=1;flashimg=1
@@ -31,7 +29,6 @@
 /misc                                emmc                      /dev/block/by-name/misc                                flags=display="Miscellaneous [ misc ]";backup=1
 
 /apusys                              emmc                      /dev/block/by-name/apusys                           flags=display="AI Processing Unit [ apusys ]";slotselect;backup=1
-/audio_dsp                         emmc                      /dev/block/by-name/audio_dsp                      flags=display="Audio DSP Driver [ audio_dsp ]";slotselect;backup=1
 /connsys_bt                        emmc                      /dev/block/by-name/connsys_bt                    flags=display="CONNSYS Bluetooth [ connsys_bt ]";slotselect;backup=1
 /connsys_wifi                      emmc                      /dev/block/by-name/connsys_wifi                  flags=display="CONNSYS WiFi [ connsys_wifi ]";slotselect;backup=1
 /connsys_gnss                      emmc                      /dev/block/by-name/connsys_gnss                  flags=display="CONNSYS GNSS [ connsys_gnss ]";slotselect;backup=1
@@ -39,20 +36,15 @@
 /ccu                                   emmc                      /dev/block/by-name/ccu                                flags=display="Camera Control Unit Driver [ ccu ]";slotselect;backup=1
 /dpm                                  emmc                      /dev/block/by-name/dpm                              flags=display="DRAM Power Management [ dpm ]";slotselect;backup=1
 /gpueb                               emmc                      /dev/block/by-name/gpueb                           flags=display="GPU Extension Driver [ gpueb ]";slotselect;backup=1
-/gz                                     emmc                      /dev/block/by-name/gz                                  flags=display="MediaTek GenieZone [ gz ]";slotselect;backup=1
-/lk                                      emmc                      /dev/block/by-name/lk                                   flags=display="Little Kernel Bootloader [ lk ]";slotselect;backup=1
 /logo                                  emmc                      /dev/block/by-name/logo                              flags=display="Splashcreen Bootlogo [ logo ]";slotselect;backup=1
 /mcf_ota_image                 emmc                      /dev/block/by-name/mcf_ota                         flags=display="Modem Configuration [ mcf_ota ]";slotselect;backup=1
 /mcupm                             emmc                      /dev/block/by-name/mcupm                          flags=display="MCU Power Management [ mcupm ]";slotselect;backup=1
 /modem                             emmc                      /dev/block/by-name/modem                         flags=display="Modem Baseband Driver [ modem ]";slotselect;backup=1
-/mvpu_algo                        emmc                      /dev/block/by-name/mvpu_algo                     flags=display="MediaTek Vision Processing Unit [ mvpu_algo ]";slotselect;backup=1
 /pi_img                              emmc                      /dev/block/by-name/pi_img                            flags=display="PICACHU [ pi_img ]";slotselect;backup=1
-/preloader_raw                  emmc                      /dev/block/by-name/preloader_raw                flags=display="MediaTek PreLoader [ preloader ]";slotselect;backup=1
 /pvmfw                  emmc                      /dev/block/by-name/pvmfw                flags=display="Protected VM Firmware [ pvmfw ]";slotselect;backup=1
 /scp                                   emmc                     /dev/block/by-name/scp                                 flags=display="System Companion Processor [ scp ]";slotselect;backup=1
 /spmfw                              emmc                      /dev/block/by-name/spmfw                           flags=display="System Power Manager Firmware [ spmfw ]";slotselect;backup=1
 /sspm                                emmc                      /dev/block/by-name/sspm                              flags=display="Secure System Power Manager [ sspm ]";slotselect;backup=1
-/tee                                   emmc                      /dev/block/by-name/tee                                 flags=display="Trusted Execution Environment [ tee ]";slotselect;backup=1
 /vcp                                  emmc                      /dev/block/by-name/vcp                                 flags=display="Video Driver [ vcp ]";slotselect;backup=1
 
 /usb_otg            auto      /dev/block/sdd1                                                       flags=display="External Storage [ usb-otg ]";storage;wipeingui;removable;fsflags=utf8

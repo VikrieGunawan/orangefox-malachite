@@ -37,6 +37,8 @@
 #include <fcntl.h>
 #include <string.h>
 #include <string>
+#include <unistd.h>
+#include <android-base/file.h>
 #include <android-base/logging.h>
 
 #if !defined(ARCH_X86)
@@ -49,6 +51,32 @@
 namespace android {
 namespace bootable {
 #if !defined(ARCH_X86)
+/* The boot ROM loads the preloader from the active boot LU (sda for slot a,
+ * sdb for slot b). ROM zips carry no preloader, so before switching make sure
+ * the target LU holds a real preloader: a UFS/COMBO/EMMC boot header followed
+ * by the "MMM" preloader header, the same layout mtk_plpath_utils expects.
+ * If it does not, refuse the switch instead of leaving a phone that only
+ * reaches BROM mode. */
+static bool preloader_lu_valid(int boot)
+{
+    const char *dev = boot == 2 ? "/dev/block/sdb" : "/dev/block/sda";
+    char head[4] = {0}, pl[3] = {0};
+    int fd = open(dev, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        LOG(ERROR) << "cannot open " << dev << ": " << strerror(errno);
+        return false;
+    }
+    bool ok = android::base::ReadFully(fd, head, sizeof(head));
+    off_t pl_off = !strncmp(head, "EMMC", 4) ? 0x800 : 0x1000;
+    ok = ok && (!strncmp(head, "UFS", 3) || !strncmp(head, "COMB", 4) || !strncmp(head, "EMMC", 4));
+    ok = ok && lseek(fd, pl_off, SEEK_SET) == pl_off &&
+         android::base::ReadFully(fd, pl, sizeof(pl)) && !strncmp(pl, "MMM", 3);
+    close(fd);
+    if (!ok)
+        LOG(ERROR) << dev << " does not hold a valid preloader";
+    return ok;
+}
+
 static bool ufs_set_active_boot_part(int boot)
 {
     struct ufs_ioctl_query_data idata;
@@ -92,6 +120,11 @@ bool BootControlExt::SetBootRegionSlot(unsigned int slot) {
     boot_part = 2;
   else
     boot_part = 1;
+
+  if (!preloader_lu_valid(boot_part)) {
+      LOG(ERROR) << "refusing to switch the boot LU to an invalid preloader";
+      return false;
+  }
 
   if (!ufs_set_active_boot_part(boot_part))
       return false;

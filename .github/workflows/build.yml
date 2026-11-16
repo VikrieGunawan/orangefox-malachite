@@ -154,7 +154,8 @@ jobs:
             git -C bootable/recovery apply --3way "$PWD/$P"
             echo "Haptics patch applied with a 3way merge"
           else
-            echo "::warning::Haptics patch does not apply to this bootable/recovery revision, continuing without it"
+            echo "::error::Haptics patch does not apply to this bootable/recovery revision"
+            exit 1
           fi
 
       - name: Apply the flashlight toggle patch
@@ -163,6 +164,13 @@ jobs:
           P=device/xiaomi/malachite/patches/0002-flashlight-toggle-by-saved-state.patch
           git -C bootable/recovery apply "$PWD/$P" || { echo "::error::Flashlight patch does not apply"; exit 1; }
           echo "Flashlight patch applied"
+
+      - name: Apply the India time zone patch
+        run: |
+          cd $HOME/fox
+          P=device/xiaomi/malachite/patches/0003-india-timezone.patch
+          git -C bootable/recovery apply "$PWD/$P" || { echo "::error::India time zone patch does not apply"; exit 1; }
+          echo "India time zone patch applied"
 
       - name: Use the maintainer avatar
         run: |

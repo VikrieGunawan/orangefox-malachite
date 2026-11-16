@@ -1,0 +1,12 @@
+diff --git a/gui/theme/portrait_hdpi/pages/settings.xml b/gui/theme/portrait_hdpi/pages/settings.xml
+index db82784..a73ce28 100644
+--- a/gui/theme/portrait_hdpi/pages/settings.xml
++++ b/gui/theme/portrait_hdpi/pages/settings.xml
+@@ -770,6 +770,7 @@
+ 				<listitem name="{@utcp3}">SAUST-3;SAUDT</listitem>
+ 				<listitem name="{@utcp4}">WST-4;WDT</listitem>
+ 				<listitem name="{@utcp5}">PAKST-5;PAKDT</listitem>
++				<listitem name="(UTC +5:30) India, Sri Lanka">IST-5:30</listitem>
+ 				<listitem name="{@utcp6}">TASHST-6;TASHDT</listitem>
+ 				<listitem name="{@utcp7}">THAIST-7;THAIDT</listitem>
+ 				<listitem name="{@utcp8}">TAIST-8;TAIDT</listitem>
