@@ -1,6 +1,0 @@
-service vendor-watchdog /system/bin/vendor_watchdog
-	class none
-	user root
-	group root
-	oneshot
-	seclabel u:r:recovery:s0

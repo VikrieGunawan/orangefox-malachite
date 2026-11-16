@@ -57,7 +57,4 @@ on boot
     setprop sys.usb.config adb
 
 on property:twrp.modules.loaded=true
-    start vendor-watchdog
-
-on property:sys.vendor.watchdog=ready
     start vibratorfeature-hal-service
