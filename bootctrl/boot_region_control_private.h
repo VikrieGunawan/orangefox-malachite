@@ -35,11 +35,18 @@
 
 #pragma once
 
+#include <string>
+
 namespace android {
 namespace bootable {
 class BootControlExt {
   public:
+    void Init();
     bool SetBootRegionSlot(unsigned int slot);
+
+  private:
+    // Contents of boot LU A and B when the HAL started.
+    std::string initial_lu_[2];
 };
 }
 }

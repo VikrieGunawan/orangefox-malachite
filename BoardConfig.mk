@@ -134,7 +134,7 @@ TW_NO_LEGACY_PROPS := true
 TW_NO_BIND_SYSTEM := true
 TW_BACKUP_EXCLUSIONS := /data/fonts
 TW_DEVICE_VERSION := Redmi_Note_14_Pro_5G
-TARGET_USE_CUSTOM_LUN_FILE_PATH := /config/usb_gadget/g1/functions/mass_storage.usb0/lun.%d/file
+TARGET_USE_CUSTOM_LUN_FILE_PATH := /config/usb_gadget/g1/functions/mass_storage.0/lun.%d/file
 TW_USE_SERIALNO_PROPERTY_FOR_DEVICE_ID := true
 
 TW_INCLUDE_FASTBOOTD := true
