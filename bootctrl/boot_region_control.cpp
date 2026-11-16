@@ -52,29 +52,46 @@ namespace android {
 namespace bootable {
 #if !defined(ARCH_X86)
 /* The boot ROM loads the preloader from the active boot LU (sda for slot a,
- * sdb for slot b). ROM zips carry no preloader, so before switching make sure
- * the target LU holds a real preloader: a UFS/COMBO/EMMC boot header followed
- * by the "MMM" preloader header, the same layout mtk_plpath_utils expects.
- * If it does not, refuse the switch instead of leaving a phone that only
- * reaches BROM mode. */
-static bool preloader_lu_valid(int boot)
+ * sdb for slot b), and a preloader that the boot ROM rejects leaves a phone
+ * that only reaches BROM mode. AOSP ROM zips carry no preloader and the AOSP
+ * boot HAL never touches the boot LU, so the copy behind the other slot can
+ * be missing or left over from an older firmware. The boot LU is therefore
+ * switched only when that is known to be safe:
+ *   - both LUs hold the same bytes (the switch changes nothing), or
+ *   - the target LU was rewritten while this HAL was running, which is what
+ *     a HyperOS package does right before it asks for the slot switch.
+ * In every other case the phone keeps booting the preloader it is using
+ * now, as it does under the AOSP boot HAL. */
+static const char *boot_lu_path(int boot)
 {
-    const char *dev = boot == 2 ? "/dev/block/sdb" : "/dev/block/sda";
-    char head[4] = {0}, pl[3] = {0};
-    int fd = open(dev, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        LOG(ERROR) << "cannot open " << dev << ": " << strerror(errno);
+    return boot == 2 ? "/dev/block/sdb" : "/dev/block/sda";
+}
+
+/* Boot LUs are 1 MiB on malachite, so reading one whole is cheap. */
+static bool read_boot_lu(int boot, std::string *data)
+{
+    data->clear();
+    if (!android::base::ReadFileToString(boot_lu_path(boot), data) || data->empty()) {
+        LOG(ERROR) << "cannot read " << boot_lu_path(boot) << ": " << strerror(errno);
+        data->clear();
         return false;
     }
-    bool ok = android::base::ReadFully(fd, head, sizeof(head));
-    off_t pl_off = !strncmp(head, "EMMC", 4) ? 0x800 : 0x1000;
-    ok = ok && (!strncmp(head, "UFS", 3) || !strncmp(head, "COMB", 4) || !strncmp(head, "EMMC", 4));
-    ok = ok && lseek(fd, pl_off, SEEK_SET) == pl_off &&
-         android::base::ReadFully(fd, pl, sizeof(pl)) && !strncmp(pl, "MMM", 3);
-    close(fd);
-    if (!ok)
-        LOG(ERROR) << dev << " does not hold a valid preloader";
-    return ok;
+    return true;
+}
+
+/* A real preloader image: a UFS/COMBO/EMMC boot header followed by the "MMM"
+ * preloader header, the same layout mtk_plpath_utils expects. */
+static bool preloader_valid(const std::string &lu)
+{
+    size_t pl_off;
+
+    if (!lu.compare(0, 4, "EMMC"))
+        pl_off = 0x800;
+    else if (!lu.compare(0, 3, "UFS") || !lu.compare(0, 4, "COMB"))
+        pl_off = 0x1000;
+    else
+        return false;
+    return lu.size() >= pl_off + 3 && !lu.compare(pl_off, 3, "MMM");
 }
 
 static bool ufs_set_active_boot_part(int boot)
@@ -105,15 +122,21 @@ static bool ufs_set_active_boot_part(int boot)
     return ret;
 }
 
+void BootControlExt::Init() {
+  /* Remember what both boot LUs hold before anything is flashed. */
+  read_boot_lu(1, &initial_lu_[0]);
+  read_boot_lu(2, &initial_lu_[1]);
+}
+
 bool BootControlExt::SetBootRegionSlot(unsigned int slot) {
   int boot_part = 0;
+  std::string target, other;
 
-
-  LOG(ERROR) << "setActiveBootSlot SetBootRegionSlot " << slot;
+  LOG(INFO) << "setActiveBootSlot SetBootRegionSlot " << slot;
   /* slot 0 is A , slot 1 is B */
   if (slot >= 2) {
     LOG(ERROR) << "Wrong Slot value " << slot;
-    return 0;
+    return false;
   }
 
   if(slot)
@@ -121,9 +144,22 @@ bool BootControlExt::SetBootRegionSlot(unsigned int slot) {
   else
     boot_part = 1;
 
-  if (!preloader_lu_valid(boot_part)) {
-      LOG(ERROR) << "refusing to switch the boot LU to an invalid preloader";
-      return false;
+  /* The slot itself is already switched in misc at this point. Keeping the
+   * current boot LU is not a failure, so every "keep" path returns true;
+   * returning false would report a finished install as failed. */
+  if (!read_boot_lu(boot_part, &target) || !preloader_valid(target)) {
+    LOG(WARNING) << boot_lu_path(boot_part)
+                 << " does not hold a valid preloader, keeping the current boot LU";
+    return true;
+  }
+
+  bool same = read_boot_lu(boot_part == 1 ? 2 : 1, &other) && target == other;
+  const std::string &before = initial_lu_[boot_part - 1];
+  bool rewritten = !before.empty() && target != before;
+  if (!same && !rewritten) {
+    LOG(WARNING) << boot_lu_path(boot_part) << " holds a different preloader that was not "
+                 << "written in this session, keeping the current boot LU";
+    return true;
   }
 
   if (!ufs_set_active_boot_part(boot_part))
@@ -132,6 +168,9 @@ bool BootControlExt::SetBootRegionSlot(unsigned int slot) {
   return true;
 }
 #else
+void BootControlExt::Init() {
+}
+
 bool BootControlExt::SetBootRegionSlot(unsigned int slot) {
   return true;
 }
