@@ -8,7 +8,7 @@
 
 
 
-/boot                                 emmc                      /dev/block/by-name/boot                              flags=display="Kernel Boot Image [ boot ] ";slotselect;backup=1;flashimg=1
+/boot                                 emmc                      /dev/block/by-name/boot                              flags=display="Kernel Boot Image [ boot ]";slotselect;backup=1;flashimg=1
 /init_boot                     emmc                      /dev/block/by-name/init_boot                  flags=display="Init Boot Image [ init_boot ]";slotselect;backup=1;flashimg=1
 /vendor_boot                     emmc                      /dev/block/by-name/vendor_boot                  flags=display="Vendor Boot Image [ vendor_boot ]";slotselect;backup=1;flashimg=1
 /dtbo                                 emmc                      /dev/block/by-name/dtbo                              flags=display="Device Tree Blob Overlay [ dtbo ]";slotselect;backup=1
@@ -26,6 +26,6 @@
 /proinfo                              emmc                      /dev/block/by-name/proinfo                          flags=display="ProInfo [ proinfo ]";backup=1
 /misc                                emmc                      /dev/block/by-name/misc                                flags=display="Miscellaneous [ misc ]";backup=1
 
-/logo                                  emmc                      /dev/block/by-name/logo                              flags=display="Splashcreen Bootlogo [ logo ]";slotselect;backup=1
+/logo                                  emmc                      /dev/block/by-name/logo                              flags=display="Splashscreen Bootlogo [ logo ]";slotselect;backup=1
 
 /usb_otg            auto      /dev/block/sdd1      /dev/block/sdd                                   flags=display="External Storage [ usb-otg ]";storage;wipeingui;removable;fsflags=utf8
