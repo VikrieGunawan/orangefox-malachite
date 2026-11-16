@@ -28,4 +28,4 @@
 
 /logo                                  emmc                      /dev/block/by-name/logo                              flags=display="Splashcreen Bootlogo [ logo ]";slotselect;backup=1
 
-/usb_otg            auto      /dev/block/sdd1                                                       flags=display="External Storage [ usb-otg ]";storage;wipeingui;removable;fsflags=utf8
+/usb_otg            auto      /dev/block/sdd1      /dev/block/sdd                                   flags=display="External Storage [ usb-otg ]";storage;wipeingui;removable;fsflags=utf8
