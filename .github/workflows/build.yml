@@ -6,7 +6,7 @@ env:
   SYNC_JOBS: 6
   BUILD_JOBS: 2
   MIN_FREE_MB: 20000
-  SWAP_MAX_MB: 12288
+  SWAP_MAX_MB: 30720
   SWAP_MIN_MB: 4096
 
 on:
@@ -16,6 +16,11 @@ on:
         description: Add androidboot.selinux=permissive to the vendor cmdline only if the recovery fails to boot with SELinux enforcing
         required: false
         default: false
+        type: boolean
+      slim_sync:
+        description: Skip emulator/google/linaro device trees and GKI kernel prebuilts during the sync (smaller tree, much smaller soong analysis). Turn off only if the build complains about a missing module.
+        required: false
+        default: true
         type: boolean
 
 jobs:
@@ -38,9 +43,6 @@ jobs:
             /usr/local/julia* /usr/lib/firefox /opt/az || true
           sudo docker image prune --all --force || true
           sudo apt-get clean
-          # Swap is created only after the sync, sized to the space that is left then.
-          # A fixed 16G swap here would eat the same disk the source tree needs and the
-          # sync dies with "no space left on device" (that is what killed the old runs).
           sudo swapoff -a || true
           sudo rm -f /mnt/swapfile /tmp/swapfile || true
           df -h / /mnt
@@ -48,7 +50,6 @@ jobs:
           MNT_MB=$(df -BM --output=avail /mnt 2>/dev/null | tail -1 | tr -dc '0-9')
           MNT_MB=${MNT_MB:-0}
           if [ "$MNT_MB" -gt "$ROOT_MB" ]; then
-            # /mnt is the bigger disk: source tree there, build output on /
             sudo mkdir -p /mnt/fox && sudo chown -R "$(id -u):$(id -g)" /mnt/fox
             ln -sfn /mnt/fox /home/runner/fox
             AVAIL=$MNT_MB
@@ -56,7 +57,6 @@ jobs:
             OUTVAL="$HOME/fox-out"
             echo "OUT_DIR=$OUTVAL" >> "$GITHUB_ENV"
           else
-            # / is the bigger disk: source tree there, build output on /mnt when it fits
             mkdir -p /home/runner/fox
             AVAIL=$ROOT_MB
             if [ "$MNT_MB" -gt 10000 ]; then
@@ -94,7 +94,9 @@ jobs:
           sudo apt-get clean
 
       - name: Sync OrangeFox fox_16.0 source tree
-        timeout-minutes: 160
+        timeout-minutes: 110
+        env:
+          SLIM: ${{ inputs.slim_sync }}
         run: |
           mkdir -p $HOME/fox && cd $HOME/fox
           OK=0
@@ -107,6 +109,17 @@ jobs:
           if [ "$OK" != 1 ]; then
             echo "::error::repo init failed for $FOX_MANIFEST_URL branch $FOX_BRANCH"
             exit 1
+          fi
+          if [ "$SLIM" = "true" ]; then
+            if [ -f "$GITHUB_WORKSPACE/device_tree/local_manifests/slim.xml" ]; then
+              mkdir -p .repo/local_manifests
+              cp "$GITHUB_WORKSPACE/device_tree/local_manifests/slim.xml" .repo/local_manifests/slim.xml
+              echo "Slim sync enabled: $(grep -c 'remove-project' .repo/local_manifests/slim.xml) projects dropped from the manifest"
+            else
+              echo "::warning::slim_sync is true but local_manifests/slim.xml is missing in this repo, syncing the full manifest"
+            fi
+          else
+            echo "Slim sync disabled by input, syncing the full manifest"
           fi
           (
             while true; do
@@ -200,15 +213,11 @@ jobs:
       - name: Trim repo metadata and create build swap
         run: |
           cd $HOME/fox
-          # The tree is fully synced now, so this is the right moment to reclaim repo
-          # metadata space and to size the swap from the space that is really left,
-          # instead of reserving a fixed 16G before the sync.
           rm -rf .repo/project-objects .repo/worktrees
           TREE_DEV=$(df --output=source "$HOME/fox" | tail -1)
           OUT_DEV=$(df --output=source "$OUT_DIR" | tail -1)
           FREE_MB=$(df -BM --output=avail "$HOME/fox" | tail -1 | tr -dc '0-9')
           if [ "$TREE_DEV" = "$OUT_DEV" ]; then
-            # The build output grows on the same disk as the tree: keep room for it.
             KEEP_MB=12288
             echo "::warning::The build output shares the source tree disk, swap will be kept small"
           else
@@ -236,7 +245,7 @@ jobs:
           swapon --show || true
 
       - name: Build OrangeFox vendor_boot image
-        timeout-minutes: 180
+        timeout-minutes: 230
         env:
           PERM: ${{ inputs.selinux_permissive }}
         run: |
@@ -248,9 +257,10 @@ jobs:
           export FOX_VIRTUAL_AB_DEVICE=1
           export FOX_VENDOR_BOOT_RECOVERY=1
           export FOX_INSTALLER_VENDOR_BOOT_RAMDISK_INSTALL=1
-          # Memory guards: soong_ui is a Go binary, GOMEMLIMIT keeps its heap from
-          # spiking into an OOM kill, _JAVA_OPTIONS caps any javac heap.
-          export GOMEMLIMIT=6GiB
+          # GOMEMLIMIT is intentionally not set: soong_build does not inherit this
+          # environment (build/soong/ui/build/soong.go builds its invocationEnv
+          # explicitly), so it never reached the analysis process. The memory
+          # levers here are the slim manifest, the 30G swap and -j2.
           export _JAVA_OPTIONS=-Xmx2g
           ulimit -c 0
           if [ "$PERM" = "true" ]; then export MALACHITE_RECOVERY_PERMISSIVE=true; fi
