@@ -7,10 +7,12 @@ purpose. make_f2fs then fails on the raw block device with
 unmountable until reboot. Destroy the mapping right before the wipe.
 
 The code links against libdm (dm::DeviceMapper), so Android.mk also adds
-libdm to the recovery executable's LOCAL_STATIC_LIBRARIES: without it the
-compile cannot even find the <dm/dm.h> header, because the recovery module
-does not inherit libdm's exported include dir. Observed as
-"partitionmanager.cpp:61:10: fatal error: 'dm/dm.h' file not found" at 92%.
+libdm to the recovery executable's LOCAL_STATIC_LIBRARIES. Note that the
+include must be <libdm/dm.h>, not <dm/dm.h>: the OrangeFox fox_16.0 manifest
+replaces platform/system/core with the OrangeFox fork, whose libdm headers
+live in system/core/fs_mgr/libdm/include/libdm/ (there is no include/dm/
+directory), so <dm/dm.h> used to break the build with
+"partitionmanager.cpp:61:10: fatal error: 'dm/dm.h' file not found".
 
 --- a/partitionmanager.cpp
 +++ b/partitionmanager.cpp
@@ -18,10 +20,22 @@ does not inherit libdm's exported include dir. Observed as
  #include <fs_mgr/roots.h>
  #include <libgsi/libgsi.h>
  #include <liblp/liblp.h>
-+#include <dm/dm.h>
++#include <libdm/dm.h>
  #include <libgsi/libgsi.h>
  #include <liblp/builder.h>
  #include <libsnapshot/snapshot.h>
+@@ -1983,7 +1984,11 @@
+ 			if (metadata != NULL)
+ 				metadata->Mount(true);
+ 			if (!Check_Pending_Merges())
+ 				return false;
+ 		}
++		// Unmap_Super_Devices() deliberately skips the userdata dm device, so
++		// the metadata-encryption mapping (mapper/userdata) is still alive here
++		// and make_f2fs would fail with EBUSY. Destroy it before the wipe.
++		android::dm::DeviceMapper::Instance().DeleteDeviceIfExists("userdata");
+ 		ret = dat->Wipe_Encryption();
+ 	} else {
 --- a/Android.mk
 +++ b/Android.mk
 @@ -142,6 +142,7 @@
