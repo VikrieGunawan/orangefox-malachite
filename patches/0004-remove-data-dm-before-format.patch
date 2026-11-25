@@ -1,0 +1,41 @@
+partitionmanager.cpp: destroy the metadata-encryption dm device before Format Data
+
+Format Data on a metadata-encrypted device unmounts /data but leaves the dm
+mapping (mapper/userdata) alive, because Unmap_Super_Devices skips userdata on
+purpose. make_f2fs then fails on the raw block device with
+"Error: In use by the system!" (EBUSY), the format is refused, and /data stays
+unmountable until reboot. Destroy the mapping right before the wipe.
+
+diff --git a/partitionmanager.cpp b/partitionmanager.cpp
+index 2fe6694..6da5b05 100644
+--- a/partitionmanager.cpp
++++ b/partitionmanager.cpp
+@@ -58,6 +58,7 @@
+ #include <fs_mgr/roots.h>
+ #include <libgsi/libgsi.h>
+ #include <liblp/liblp.h>
++#include <dm/dm.h>
+ #include <libgsi/libgsi.h>
+ #include <liblp/builder.h>
+ #include <libsnapshot/snapshot.h>
+@@ -1979,6 +1980,20 @@ int TWPartitionManager::Format_Data(void) {
+ 			if (!Check_Pending_Merges())
+ 				return false;
+ 		}
++		static const std::string mapper_prefix = "/dev/block/mapper/";
++		// The metadata-encryption dm device (mapper/userdata) still holds the
++		// raw data block exclusively after decryption, and Unmap_Super_Devices
++		// deliberately skips it, so make_f2fs on the raw device fails with
++		// "In use by the system!" (EBUSY) and Format Data cannot remove the
++		// encryption. Destroy the mapping here, right before the wipe.
++		if (dat->Decrypted_Block_Device.compare(0, mapper_prefix.size(), mapper_prefix) == 0) {
++			auto& dmi = dm::DeviceMapper::Instance();
++			std::string dm_name = dat->Decrypted_Block_Device.substr(mapper_prefix.size());
++			if (dmi.DeleteDeviceIfExists(dm_name))
++				LOGINFO("Removed dm device '%s' before formatting data", dm_name.c_str());
++			else
++				LOGINFO("dm device '%s' was not present before formatting data", dm_name.c_str());
++		}
+ 		ret = dat->Wipe_Encryption();
+ 	} else {
+ 		gui_msg(Msg(msg::kError, "unable_to_locate=Unable to locate {1}.")("/data"));
