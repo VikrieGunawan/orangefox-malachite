@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Slim sync: drops emulator/google/linaro/amlogic device trees, GKI kernel
+     prebuilts, Trusty sources and test projects that a malachite recovery
+     build never uses. Takes only the device/kernel/bootable/trusty/test
+     parts of OrangeFox's own remove-minimal.xml for fox_16.0 plus the same
+     list used by the earlier slim sync. optional="true" keeps repo happy if
+     a project disappears from the manifest. Rerun the workflow with
+     slim_sync=false if the build ever complains about a missing module. -->
+<manifest>
+  <remove-project name="device/amlogic/yukawa" optional="true" />
+  <remove-project name="device/amlogic/yukawa-kernel" optional="true" />
+  <remove-project name="device/common" optional="true" />
+  <remove-project name="device/generic/arm64" optional="true" />
+  <remove-project name="device/generic/armv7-a-neon" optional="true" />
+  <remove-project name="device/generic/art" optional="true" />
+  <remove-project name="device/generic/car" optional="true" />
+  <remove-project name="device/generic/common" optional="true" />
+  <remove-project name="device/generic/goldfish" optional="true" />
+  <remove-project name="device/generic/goldfish-opengl" optional="true" />
+  <remove-project name="device/generic/trusty" optional="true" />
+  <remove-project name="device/generic/x86" optional="true" />
+  <remove-project name="device/generic/x86_64" optional="true" />
+  <remove-project name="device/google/atv" optional="true" />
+  <remove-project name="device/google/common/etm" optional="true" />
+  <remove-project name="device/google/contexthub" optional="true" />
+  <remove-project name="device/google/cuttlefish" optional="true" />
+  <remove-project name="device/google/cuttlefish_prebuilts" optional="true" />
+  <remove-project name="device/google/cuttlefish_vmm" optional="true" />
+  <remove-project name="device/google/trout" optional="true" />
+  <remove-project name="device/google_car" optional="true" />
+  <remove-project name="device/linaro/dragonboard" optional="true" />
+  <remove-project name="device/linaro/dragonboard-kernel" optional="true" />
+  <remove-project name="device/linaro/hikey" optional="true" />
+  <remove-project name="device/linaro/hikey-kernel" optional="true" />
+  <remove-project name="device/sample" optional="true" />
+  <remove-project name="kernel/prebuilts/6.1/arm64" optional="true" />
+  <remove-project name="kernel/prebuilts/6.1/x86-64" optional="true" />
+  <remove-project name="kernel/prebuilts/6.12/arm64" optional="true" />
+  <remove-project name="kernel/prebuilts/6.12/x86-64" optional="true" />
+  <remove-project name="kernel/prebuilts/6.6/arm64" optional="true" />
+  <remove-project name="kernel/prebuilts/6.6/x86-64" optional="true" />
+  <remove-project name="kernel/prebuilts/common-modules/trusty/6.12/arm64" optional="true" />
+  <remove-project name="kernel/prebuilts/common-modules/trusty/6.6/arm64" optional="true" />
+  <remove-project name="kernel/prebuilts/common-modules/virtual-device/6.1/arm64" optional="true" />
+  <remove-project name="kernel/prebuilts/common-modules/virtual-device/6.1/x86-64" optional="true" />
+  <remove-project name="kernel/prebuilts/common-modules/virtual-device/6.12/arm64" optional="true" />
+  <remove-project name="kernel/prebuilts/common-modules/virtual-device/6.12/x86-64" optional="true" />
+  <remove-project name="kernel/prebuilts/common-modules/virtual-device/6.6/arm64" optional="true" />
+  <remove-project name="kernel/prebuilts/common-modules/virtual-device/6.6/x86-64" optional="true" />
+  <remove-project name="kernel/prebuilts/common-modules/virtual-device/mainline/arm64" optional="true" />
+  <remove-project name="kernel/prebuilts/common-modules/virtual-device/mainline/x86-64" optional="true" />
+  <remove-project name="kernel/prebuilts/mainline/arm64" optional="true" />
+  <remove-project name="kernel/prebuilts/mainline/x86-64" optional="true" />
+  <remove-project name="kernel/tests" optional="true" />
+  <remove-project name="platform/bootable/deprecated-ota" optional="true" />
+  <remove-project name="platform/developers/build" optional="true" />
+  <remove-project name="platform/developers/samples/android" optional="true" />
+  <remove-project name="platform/test/catbox" optional="true" />
+  <remove-project name="platform/test/cts-root" optional="true" />
+  <remove-project name="platform/test/mlts/benchmark" optional="true" />
+  <remove-project name="platform/test/mlts/models" optional="true" />
+  <remove-project name="platform/test/mts" optional="true" />
+  <remove-project name="platform/test/vts-testcase/kernel" optional="true" />
+  <remove-project name="platform/test/vts-testcase/nbu" optional="true" />
+  <remove-project name="platform/test/vts-testcase/performance" optional="true" />
+  <remove-project name="platform/test/vts-testcase/security" optional="true" />
+  <remove-project name="platform/test/vts-testcase/vndk" optional="true" />
+  <remove-project name="trusty/app/authmgr" optional="true" />
+  <remove-project name="trusty/app/avb" optional="true" />
+  <remove-project name="trusty/app/cast-auth" optional="true" />
+  <remove-project name="trusty/app/confirmationui" optional="true" />
+  <remove-project name="trusty/app/gatekeeper" optional="true" />
+  <remove-project name="trusty/app/keymaster" optional="true" />
+  <remove-project name="trusty/app/keymint" optional="true" />
+  <remove-project name="trusty/app/sample" optional="true" />
+  <remove-project name="trusty/app/secretkeeper" optional="true" />
+  <remove-project name="trusty/app/storage" optional="true" />
+  <remove-project name="trusty/device/arm/generic-arm64" optional="true" />
+  <remove-project name="trusty/device/arm/vexpress-a15" optional="true" />
+  <remove-project name="trusty/device/common" optional="true" />
+  <remove-project name="trusty/device/desktop" optional="true" />
+  <remove-project name="trusty/device/nxp/imx7d" optional="true" />
+  <remove-project name="trusty/device/x86/generic-x86_64" optional="true" />
+  <remove-project name="trusty/host/common" optional="true" />
+  <remove-project name="trusty/lib" optional="true" />
+  <remove-project name="trusty/lk/nxp" optional="true" />
+  <remove-project name="trusty/lk/trusty" optional="true" />
+  <remove-project name="trusty/user/desktop" optional="true" />
+  <remove-project name="trusty/vendor/google/aosp" optional="true" />
+</manifest>
