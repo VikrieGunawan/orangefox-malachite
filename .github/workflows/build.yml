@@ -5,9 +5,10 @@ env:
   FOX_BRANCH: fox_16.0
   SYNC_JOBS: 6
   BUILD_JOBS: 2
-  MIN_FREE_MB: 20000
+  MIN_FREE_MB: 30000
   SWAP_MAX_MB: 30720
   SWAP_MIN_MB: 4096
+  LOW_DISK_MB: 2500
 
 on:
   workflow_dispatch:
@@ -18,7 +19,7 @@ on:
         default: false
         type: boolean
       slim_sync:
-        description: Skip emulator/google/linaro device trees and GKI kernel prebuilts during the sync (smaller tree, much smaller soong analysis). Turn off only if the build complains about a missing module.
+        description: Skip emulator/google/linaro device trees, GKI kernel prebuilts and test projects during the sync (smaller tree, much smaller soong analysis). Turn off only if the build complains about a missing module.
         required: false
         default: true
         type: boolean
@@ -41,10 +42,11 @@ jobs:
             /usr/local/share/boost /usr/share/swift /usr/local/.ghcup /opt/microsoft /opt/google \
             /usr/local/share/powershell /usr/lib/google-cloud-sdk /usr/lib/jvm /usr/share/miniconda \
             /usr/local/julia* /usr/lib/firefox /opt/az || true
-          sudo docker image prune --all --force || true
+          sudo docker system prune --all --force --volumes 2>/dev/null || true
+          sudo journalctl --vacuum-size=50M 2>/dev/null || true
           sudo apt-get clean
           sudo swapoff -a || true
-          sudo rm -f /mnt/swapfile /tmp/swapfile || true
+          sudo rm -f /mnt/swapfile /tmp/swapfile /swapfile || true
           df -h / /mnt
           ROOT_MB=$(df -BM --output=avail / | tail -1 | tr -dc '0-9')
           MNT_MB=$(df -BM --output=avail /mnt 2>/dev/null | tail -1 | tr -dc '0-9')
@@ -71,7 +73,7 @@ jobs:
           fi
           echo "Source tree goes to $HOME/fox, ${AVAIL} MB free on that disk, build output goes to ${OUTVAL}"
           if [ "$AVAIL" -lt "$MIN_FREE_MB" ]; then
-            echo "::error::Not enough disk space (${AVAIL} MB free). At least ${MIN_FREE_MB} MB is required."
+            echo "::error::Not enough disk space (${AVAIL} MB free). At least ${MIN_FREE_MB} MB is required for the phased sync."
             exit 1
           fi
 
@@ -85,12 +87,13 @@ jobs:
           mkdir -p $HOME/bin
           curl -s https://storage.googleapis.com/git-repo-downloads/repo > $HOME/bin/repo
           chmod a+x $HOME/bin/repo
-          echo "$HOME/bin" >> $GITHUB_PATH
+          echo "$HOME/bin" >> "$GITHUB_PATH"
           git config --global user.name "github-actions"
           git config --global user.email "github-actions@users.noreply.github.com"
           git config --global color.ui false
           git config --global gc.auto 0
           git lfs install
+          sudo rm -rf /var/lib/apt/lists/*
           sudo apt-get clean
 
       - name: Sync OrangeFox fox_16.0 source tree
@@ -99,6 +102,7 @@ jobs:
           SLIM: ${{ inputs.slim_sync }}
         run: |
           mkdir -p $HOME/fox && cd $HOME/fox
+          rm -f "$HOME/lowdisk"
           OK=0
           for i in 1 2 3; do
             rm -rf .repo
@@ -121,29 +125,66 @@ jobs:
           else
             echo "Slim sync disabled by input, syncing the full manifest"
           fi
+          PREBUILTS=$(repo list -a -p 2>/dev/null | grep '^prebuilts/' | sort | tr '\n' ' ')
+          OTHERS=$(repo list -a -p 2>/dev/null | grep -v '^prebuilts/' | sort | tr '\n' ' ')
+          if [ -z "$OTHERS" ] || [ -z "$PREBUILTS" ]; then
+            echo "::error::repo list did not return a usable project set, cannot plan the phased sync"
+            exit 1
+          fi
+          echo "Phased sync plan: $(echo $PREBUILTS | wc -w) prebuilt projects first, then $(echo $OTHERS | wc -w) source projects"
           (
             while true; do
               sleep 120
               A=$(df -BM --output=avail "$HOME/fox" 2>/dev/null | tail -1 | tr -dc '0-9')
               echo "[watch] $(date -u +%H:%M:%S) source disk ${A:-unknown} MB free"
+              if [ -n "$A" ] && [ "$A" -lt "$LOW_DISK_MB" ]; then
+                echo "::error::Source disk dropped below ${LOW_DISK_MB} MB, stopping the sync to protect the runner"
+                touch "$HOME/lowdisk"
+                pkill -f 'repo sync' 2>/dev/null || true
+                pkill -f 'git fetch' 2>/dev/null || true
+                pkill -f 'index-pack' 2>/dev/null || true
+              fi
             done
           ) &
           LOGGER=$!
           SYNC_START=$(date -u +%s)
+          PB_OK=0
+          for i in 1 2 3 4; do
+            if repo sync -c -j2 --force-sync --no-clone-bundle --no-tags $PREBUILTS; then
+              PB_OK=1
+              break
+            fi
+            if [ -f "$HOME/lowdisk" ]; then break; fi
+            echo "Prebuilt sync attempt $i failed, retrying in 30 seconds"
+            sleep 30
+          done
+          if [ "$PB_OK" != 1 ]; then
+            kill "$LOGGER" 2>/dev/null || true
+            echo "::error::The prebuilt projects could not be synced"
+            exit 1
+          fi
+          echo "Prebuilts synced, dropping their git object data to keep room for the source phase"
+          find .repo/projects .repo/project-objects -type d -name objects -path '*prebuilts*' 2>/dev/null | while read -r o; do rm -rf "$o"/*; done
+          echo "Source disk now at $(df -BM --output=avail "$HOME/fox" | tail -1 | tr -dc '0-9') MB free"
           set +e
-          repo sync -c -j"$SYNC_JOBS" --force-sync --no-clone-bundle --no-tags
+          repo sync -c -j"$SYNC_JOBS" --force-sync --no-clone-bundle --no-tags $OTHERS
           RC=$?
-          if [ "$RC" != 0 ]; then
-            echo "First sync pass failed with code $RC, retrying with 2 jobs"
-            repo sync -c -j2 --force-sync --no-clone-bundle --no-tags
+          if [ "$RC" != 0 ] && [ ! -f "$HOME/lowdisk" ]; then
+            echo "First source sync pass failed with code $RC, retrying with 2 jobs"
+            sleep 30
+            repo sync -c -j2 --force-sync --no-clone-bundle --no-tags $OTHERS
             RC=$?
           fi
-          if [ "$RC" != 0 ]; then
-            echo "Second sync pass failed with code $RC, final retry with 1 job"
-            repo sync -c -j1 --force-sync --no-clone-bundle --no-tags
+          if [ "$RC" != 0 ] && [ ! -f "$HOME/lowdisk" ]; then
+            echo "Second source sync pass failed with code $RC, final retry with 1 job"
+            sleep 30
+            repo sync -c -j1 --force-sync --no-clone-bundle --no-tags $OTHERS
             RC=$?
           fi
           kill "$LOGGER" 2>/dev/null || true
+          if [ "$RC" != 0 ] && [ -f "$HOME/lowdisk" ]; then
+            echo "::error::The source disk ran out of space during the sync, the run was stopped before the runner itself crashed"
+          fi
           echo "Sync finished with code $RC after $(( ($(date -u +%s) - SYNC_START) / 60 )) minutes"
           df -h "$HOME/fox" "$OUT_DIR" || df -h "$HOME/fox"
           exit $RC
@@ -213,33 +254,54 @@ jobs:
       - name: Trim repo metadata and create build swap
         run: |
           cd $HOME/fox
-          rm -rf .repo/project-objects .repo/worktrees
+          for d in projects project-objects worktrees; do
+            if [ -d ".repo/$d" ]; then
+              if [ -d ".repo/$d/bootable" ]; then
+                mv ".repo/$d/bootable" ".repo/keep-$d-bootable"
+              fi
+              rm -rf ".repo/$d"
+              mkdir -p ".repo/$d"
+              if [ -d ".repo/keep-$d-bootable" ]; then
+                mv ".repo/keep-$d-bootable" ".repo/$d/bootable"
+              fi
+            fi
+          done
           TREE_DEV=$(df --output=source "$HOME/fox" | tail -1)
           OUT_DEV=$(df --output=source "$OUT_DIR" | tail -1)
+          TREE_MNT=$(df --output=target "$HOME/fox" | tail -1)
           FREE_MB=$(df -BM --output=avail "$HOME/fox" | tail -1 | tr -dc '0-9')
           if [ "$TREE_DEV" = "$OUT_DEV" ]; then
             KEEP_MB=12288
             echo "::warning::The build output shares the source tree disk, swap will be kept small"
+          elif [ "$TREE_MNT" = "/" ]; then
+            KEEP_MB=6144
           else
             KEEP_MB=2048
           fi
           SWAP_MB=$(( FREE_MB - KEEP_MB ))
           [ "$SWAP_MB" -gt "$SWAP_MAX_MB" ] && SWAP_MB=$SWAP_MAX_MB
           [ "$SWAP_MB" -lt "$SWAP_MIN_MB" ] && SWAP_MB=$SWAP_MIN_MB
-          if [ "$(df --output=target "$HOME/fox" | tail -1)" = "/mnt" ]; then
+          if [ "$SWAP_MB" -gt $(( FREE_MB - 512 )) ]; then
+            SWAP_MB=$(( FREE_MB - 512 ))
+          fi
+          if [ "$SWAP_MB" -lt 512 ]; then
+            echo "::warning::Only ${FREE_MB} MB free on the tree disk, no swap will be created and the build will rely on RAM only"
+            df -h "$HOME/fox" "$OUT_DIR" || df -h "$HOME/fox"
+            exit 0
+          fi
+          if [ "$TREE_MNT" = "/mnt" ]; then
             SWAPFILE=/mnt/swapfile
           else
-            SWAPFILE=/tmp/swapfile
+            SWAPFILE=/swapfile
           fi
           echo "Tree disk ${FREE_MB} MB free, creating ${SWAP_MB} MB swap at ${SWAPFILE}"
-          sudo fallocate -l "${SWAP_MB}M" "$SWAPFILE" 2>/dev/null || true
-          if [ -f "$SWAPFILE" ]; then
-            sudo chmod 600 "$SWAPFILE"
-            sudo mkswap "$SWAPFILE" || true
-            sudo swapon "$SWAPFILE" || echo "::warning::swapon failed, the build will rely on RAM only"
-          else
-            echo "::warning::No swap could be created, the build will rely on RAM only"
+          if ! sudo fallocate -l "${SWAP_MB}M" "$SWAPFILE" 2>/dev/null; then
+            echo "::warning::Swap file allocation failed, the build will rely on RAM only"
+            exit 0
           fi
+          sudo chmod 600 "$SWAPFILE"
+          sudo mkswap "$SWAPFILE"
+          sudo swapon "$SWAPFILE" || echo "::warning::swapon failed, the build will rely on RAM only"
           df -h "$HOME/fox" "$OUT_DIR" || df -h "$HOME/fox"
           free -h
           swapon --show || true
@@ -257,10 +319,6 @@ jobs:
           export FOX_VIRTUAL_AB_DEVICE=1
           export FOX_VENDOR_BOOT_RECOVERY=1
           export FOX_INSTALLER_VENDOR_BOOT_RAMDISK_INSTALL=1
-          # GOMEMLIMIT is intentionally not set: soong_build does not inherit this
-          # environment (build/soong/ui/build/soong.go builds its invocationEnv
-          # explicitly), so it never reached the analysis process. The memory
-          # levers here are the slim manifest, the 30G swap and -j2.
           export _JAVA_OPTIONS=-Xmx2g
           ulimit -c 0
           if [ "$PERM" = "true" ]; then export MALACHITE_RECOVERY_PERMISSIVE=true; fi
@@ -314,7 +372,6 @@ jobs:
             tail -50 $HOME/build.log || true
             exit 1
           fi
-          # vendor_boot.img is not shipped: it has no kernel modules and stops the ROM from booting if flashed
           find "$OUT" -maxdepth 1 -name "OrangeFox*.zip" -exec cp {} "$GITHUB_WORKSPACE/output/" \;
           if ! ls "$GITHUB_WORKSPACE"/output/OrangeFox*.zip >/dev/null 2>&1; then
             echo "::error::The OrangeFox zip was not produced"
