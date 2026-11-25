@@ -5,7 +5,9 @@ env:
   FOX_BRANCH: fox_16.0
   SYNC_JOBS: 6
   BUILD_JOBS: 2
-  MIN_FREE_MB: 25000
+  MIN_FREE_MB: 20000
+  SWAP_MAX_MB: 12288
+  SWAP_MIN_MB: 4096
 
 on:
   workflow_dispatch:
@@ -36,22 +38,28 @@ jobs:
             /usr/local/julia* /usr/lib/firefox /opt/az || true
           sudo docker image prune --all --force || true
           sudo apt-get clean
+          # Swap is created only after the sync, sized to the space that is left then.
+          # A fixed 16G swap here would eat the same disk the source tree needs and the
+          # sync dies with "no space left on device" (that is what killed the old runs).
           sudo swapoff -a || true
-          sudo rm -f /mnt/swapfile || true
+          sudo rm -f /mnt/swapfile /tmp/swapfile || true
           df -h / /mnt
           ROOT_MB=$(df -BM --output=avail / | tail -1 | tr -dc '0-9')
           MNT_MB=$(df -BM --output=avail /mnt 2>/dev/null | tail -1 | tr -dc '0-9')
           MNT_MB=${MNT_MB:-0}
-          if [ "$MNT_MB" -gt "$ROOT_MB" ] && [ "$MNT_MB" -gt 15000 ]; then
+          if [ "$MNT_MB" -gt "$ROOT_MB" ]; then
+            # /mnt is the bigger disk: source tree there, build output on /
             sudo mkdir -p /mnt/fox && sudo chown -R "$(id -u):$(id -g)" /mnt/fox
             ln -sfn /mnt/fox /home/runner/fox
+            AVAIL=$MNT_MB
             mkdir -p "$HOME/fox-out"
             OUTVAL="$HOME/fox-out"
             echo "OUT_DIR=$OUTVAL" >> "$GITHUB_ENV"
-            AVAIL=$MNT_MB
           else
+            # / is the bigger disk: source tree there, build output on /mnt when it fits
             mkdir -p /home/runner/fox
-            if [ "$MNT_MB" -gt 15000 ]; then
+            AVAIL=$ROOT_MB
+            if [ "$MNT_MB" -gt 10000 ]; then
               sudo mkdir -p /mnt/fox-out && sudo chown -R "$(id -u):$(id -g)" /mnt/fox-out
               OUTVAL=/mnt/fox-out
               echo "OUT_DIR=$OUTVAL" >> "$GITHUB_ENV"
@@ -60,21 +68,12 @@ jobs:
               OUTVAL="$HOME/fox-out"
               echo "OUT_DIR=$OUTVAL" >> "$GITHUB_ENV"
             fi
-            AVAIL=$ROOT_MB
           fi
-          echo "Source tree disk has ${AVAIL} MB free, build output goes to ${OUTVAL}"
+          echo "Source tree goes to $HOME/fox, ${AVAIL} MB free on that disk, build output goes to ${OUTVAL}"
           if [ "$AVAIL" -lt "$MIN_FREE_MB" ]; then
             echo "::error::Not enough disk space (${AVAIL} MB free). At least ${MIN_FREE_MB} MB is required."
             exit 1
           fi
-          sudo fallocate -l 16G /tmp/swapfile 2>/dev/null || true
-          if [ -f /tmp/swapfile ]; then
-            sudo chmod 600 /tmp/swapfile
-            sudo mkswap /tmp/swapfile || true
-            sudo swapon /tmp/swapfile || echo "::warning::swapon failed, the build will rely on RAM only"
-          fi
-          free -h
-          swapon --show || true
 
       - name: Install build dependencies
         run: |
@@ -90,6 +89,7 @@ jobs:
           git config --global user.name "github-actions"
           git config --global user.email "github-actions@users.noreply.github.com"
           git config --global color.ui false
+          git config --global gc.auto 0
           git lfs install
           sudo apt-get clean
 
@@ -123,6 +123,11 @@ jobs:
           if [ "$RC" != 0 ]; then
             echo "First sync pass failed with code $RC, retrying with 2 jobs"
             repo sync -c -j2 --force-sync --no-clone-bundle --no-tags
+            RC=$?
+          fi
+          if [ "$RC" != 0 ]; then
+            echo "Second sync pass failed with code $RC, final retry with 1 job"
+            repo sync -c -j1 --force-sync --no-clone-bundle --no-tags
             RC=$?
           fi
           kill "$LOGGER" 2>/dev/null || true
@@ -172,16 +177,63 @@ jobs:
           git -C bootable/recovery apply "$PWD/$P" || { echo "::error::India time zone patch does not apply"; exit 1; }
           echo "India time zone patch applied"
 
+      - name: Apply the format data fix patch
+        run: |
+          cd $HOME/fox
+          P=device/xiaomi/malachite/patches/0004-remove-data-dm-before-format.patch
+          if git -C bootable/recovery apply --check "$PWD/$P"; then
+            git -C bootable/recovery apply "$PWD/$P"
+            echo "Format data patch applied"
+          elif git -C bootable/recovery apply --check --3way "$PWD/$P"; then
+            git -C bootable/recovery apply --3way "$PWD/$P"
+            echo "Format data patch applied with a 3way merge"
+          else
+            echo "::error::Format data patch does not apply to this bootable/recovery revision"
+            exit 1
+          fi
+
       - name: Use the maintainer avatar
         run: |
           cd $HOME/fox
           cp device/xiaomi/malachite/recovery/maintainer/maintainer.png bootable/recovery/gui/theme/portrait_hdpi/images/Default/About/maintainer.png
 
-      - name: Free disk space in the source tree
+      - name: Trim repo metadata and create build swap
         run: |
           cd $HOME/fox
+          # The tree is fully synced now, so this is the right moment to reclaim repo
+          # metadata space and to size the swap from the space that is really left,
+          # instead of reserving a fixed 16G before the sync.
           rm -rf .repo/project-objects .repo/worktrees
+          TREE_DEV=$(df --output=source "$HOME/fox" | tail -1)
+          OUT_DEV=$(df --output=source "$OUT_DIR" | tail -1)
+          FREE_MB=$(df -BM --output=avail "$HOME/fox" | tail -1 | tr -dc '0-9')
+          if [ "$TREE_DEV" = "$OUT_DEV" ]; then
+            # The build output grows on the same disk as the tree: keep room for it.
+            KEEP_MB=12288
+            echo "::warning::The build output shares the source tree disk, swap will be kept small"
+          else
+            KEEP_MB=2048
+          fi
+          SWAP_MB=$(( FREE_MB - KEEP_MB ))
+          [ "$SWAP_MB" -gt "$SWAP_MAX_MB" ] && SWAP_MB=$SWAP_MAX_MB
+          [ "$SWAP_MB" -lt "$SWAP_MIN_MB" ] && SWAP_MB=$SWAP_MIN_MB
+          if [ "$(df --output=target "$HOME/fox" | tail -1)" = "/mnt" ]; then
+            SWAPFILE=/mnt/swapfile
+          else
+            SWAPFILE=/tmp/swapfile
+          fi
+          echo "Tree disk ${FREE_MB} MB free, creating ${SWAP_MB} MB swap at ${SWAPFILE}"
+          sudo fallocate -l "${SWAP_MB}M" "$SWAPFILE" 2>/dev/null || true
+          if [ -f "$SWAPFILE" ]; then
+            sudo chmod 600 "$SWAPFILE"
+            sudo mkswap "$SWAPFILE" || true
+            sudo swapon "$SWAPFILE" || echo "::warning::swapon failed, the build will rely on RAM only"
+          else
+            echo "::warning::No swap could be created, the build will rely on RAM only"
+          fi
           df -h "$HOME/fox" "$OUT_DIR" || df -h "$HOME/fox"
+          free -h
+          swapon --show || true
 
       - name: Build OrangeFox vendor_boot image
         timeout-minutes: 180
@@ -196,6 +248,11 @@ jobs:
           export FOX_VIRTUAL_AB_DEVICE=1
           export FOX_VENDOR_BOOT_RECOVERY=1
           export FOX_INSTALLER_VENDOR_BOOT_RAMDISK_INSTALL=1
+          # Memory guards: soong_ui is a Go binary, GOMEMLIMIT keeps its heap from
+          # spiking into an OOM kill, _JAVA_OPTIONS caps any javac heap.
+          export GOMEMLIMIT=6GiB
+          export _JAVA_OPTIONS=-Xmx2g
+          ulimit -c 0
           if [ "$PERM" = "true" ]; then export MALACHITE_RECOVERY_PERMISSIVE=true; fi
           df -h "$HOME/fox" "$OUT_DIR" || df -h "$HOME/fox"
           free -h
@@ -228,6 +285,11 @@ jobs:
           echo "Lunch done at $(date -u +%H:%M:%S), elapsed $(( ($(date -u +%s) - BUILD_START) / 60 )) minutes, starting mka vendorbootimage"
           mka vendorbootimage -j"$BUILD_JOBS" 2>&1 | tee $HOME/build.log
           RC=${PIPESTATUS[0]}
+          if [ "$RC" != 0 ] && grep -qE "out of memory|bad_alloc|OutOfMemoryError|Killed|signal 9|exit code 137|cannot allocate" $HOME/build.log 2>/dev/null; then
+            echo "Build failed in a way that looks memory related, retrying with -j1 (ninja resumes the finished work)"
+            mka vendorbootimage -j1 2>&1 | tee -a $HOME/build.log
+            RC=${PIPESTATUS[0]}
+          fi
           kill "$LOGGER" 2>/dev/null || true
           echo "Build finished with code $RC after $(( ($(date -u +%s) - BUILD_START) / 60 )) minutes"
           df -h "$HOME/fox" "$OUT_DIR" || df -h "$HOME/fox"
@@ -258,4 +320,13 @@ jobs:
           name: OrangeFox-malachite
           path: output/*
           if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: orangefox-build-log
+          path: /home/runner/build.log
+          if-no-files-found: ignore
           retention-days: 30
