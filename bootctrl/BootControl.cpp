@@ -36,7 +36,6 @@ using ::android::hardware::boot::V1_0::CommandResult;
 using namespace android::bootable;
 
 bool BootControl::Init() {
-    implext_.Init();
     return impl_.Init();
 }
 
