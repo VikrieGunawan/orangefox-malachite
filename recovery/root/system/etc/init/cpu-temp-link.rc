@@ -1,9 +1,0 @@
-service cpu-temp-link /system/bin/cpu_temp_link
-	class none
-	user root
-	group root
-	oneshot
-	seclabel u:r:recovery:s0
-
-on property:twrp.modules.loaded=true
-	start cpu-temp-link

@@ -154,11 +154,7 @@ TARGET_USES_MKE2FS := true
 TW_INCLUDE_FUSE_NTFS := true
 TW_INCLUDE_FUSE_EXFAT := true
 
-# soc_temp_lvts.ko registers the CPU thermal zones and board_temp.ko the board
-# thermistors. Both live in vendor_dlkm and are not loaded in recovery otherwise.
-TW_LOAD_VENDOR_MODULES := "haptic.ko flashlight.ko flashlights-led191.ko lm3644.ko soc_temp_lvts.ko board_temp.ko"
-# Symlink made by /system/bin/cpu_temp_link once the modules are loaded
-TW_CUSTOM_CPU_TEMP_PATH := "/dev/cpu_temp"
+TW_LOAD_VENDOR_MODULES := "haptic.ko flashlight.ko flashlights-led191.ko lm3644.ko"
 TW_SUPPORT_INPUT_AIDL_HAPTICS := true
 TW_SUPPORT_INPUT_AIDL_HAPTICS_FQNAME := "IVibrator/vibratorfeature"
 TW_SUPPORT_INPUT_AIDL_HAPTICS_FIX_OFF := true
